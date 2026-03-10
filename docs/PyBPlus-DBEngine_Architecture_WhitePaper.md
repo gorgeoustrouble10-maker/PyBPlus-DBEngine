@@ -4,9 +4,9 @@
 
 ---
 
-**Version**: 1.8  
+**Version**: 1.9  
 **Date**: 2026  
-**Status**: Phase 1–Phase 22 (Unified Persistence, Full MVCC, Security & DevOps)
+**Status**: Phase 1–Phase 24 (Query Profiling, WAL Replication)
 
 ---
 
@@ -27,6 +27,7 @@
 13. [Phase 18: Query Enhancement & Observability | Phase 18：查询优化与可观测性](#13-phase-18-query-enhancement--observability)
 14. [Phase 19: Concurrency, Stress & Savepoints | Phase 19：并发、压力测试与保存点](#14-phase-19-concurrency-stress--savepoints)
 15. [Phase 21-22: Unified Persistence & Full MVCC | Phase 21-22：统一持久化与完整 MVCC](#15-phase-21-22-unified-persistence--full-mvcc)
+16. [Phase 24: Query Profiling & WAL Replication | Phase 24：执行计划分析与主从同步](#16-phase-24-query-profiling--wal-replication)
 
 ---
 
@@ -663,6 +664,44 @@ flowchart TB
 
 ---
 
+## 16. Phase 24: Query Profiling & WAL Replication
+## Phase 24：执行计划分析与主从同步
+## Phase 24：実行計画分析とマスタースレーブ複製
+
+### 16.1 轻量级 EXPLAIN | Lightweight EXPLAIN | 軽量 EXPLAIN
+
+- **语法**：`EXPLAIN <SQL>`，支持 SELECT、INSERT、DELETE、CREATE TABLE、DROP TABLE。
+- **输出**：
+  - **Query Type**：SELECT / INSERT / DELETE / CREATE TABLE / DROP TABLE
+  - **Execution Strategy**：TABLE_SCAN 或 INDEX_SCAN（基于 CBO-Lite）
+  - **Scan Range**：索引扫描时显示 `[start_key, end_key]`，全表扫描为 FULL
+  - **Filter Predicates**：WHERE 条件下推情况
+
+### 16.2 主从同步原型 | Master-Slave Replication Prototype | マスタースレーブ複製プロトタイプ
+
+| 角色 | 参数 | 说明 |
+|------|------|------|
+| **Master** | `--replication-port 8767` | 在端口 8767 接受 Slave 连接，推送 WAL 流 |
+| **Slave** | `--slave-of 127.0.0.1:8767` | 连接 Master，接收 WAL 并实时重放 |
+
+**数据流**：Master 的 WAL 尾读线程定期轮询 `wal_*.log`，将新增记录以 `table\tline` 格式推送给已连接的 Slave。Slave 解析并调用 `_apply_wal_line` 重放。
+
+### 16.3 运维指标增强 | Operations Metrics | オペレーションメトリクス
+
+`SHOW STATS` 新增：
+- **node_role**：MASTER / SLAVE / STANDALONE
+- **replication_lag**：Slave 与上次接收 WAL 的时间差（秒）
+
+### 16.4 一键启动集群 | One-Click Cluster | ワンクリッククラスタ
+
+```bash
+./scripts/start_cluster.sh
+```
+
+启动一主一从（Master 8765 + 复制 8767，Slave 8766），使用 `data_master`、`data_slave` 独立数据目录。
+
+---
+
 ## References
 ## 参考文献
 ## 参考文献
@@ -673,9 +712,9 @@ flowchart TB
 
 ---
 
-*Document generated from Phase 1–Phase 22 implementation.  
-本白皮书基于 Phase 1 至 Phase 22 的完整实现生成。  
-Phase 1〜Phase 22 の実装に基づいて本ホワイトペーパーを生成しました。*
+*Document generated from Phase 1–Phase 24 implementation.  
+本白皮书基于 Phase 1 至 Phase 24 的完整实现生成。  
+Phase 1〜Phase 24 の実装に基づいて本ホワイトペーパーを生成しました。*
 
 ---
 

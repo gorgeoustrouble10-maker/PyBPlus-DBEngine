@@ -4,6 +4,7 @@ Phase 15 测试：SQL 解析器、执行引擎、Wire Protocol。
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -66,6 +67,31 @@ class TestSQLExecute:
 
         msg, rows, _ = execute_sql("SELECT * FROM t", table)
         assert len(rows) == 0
+
+    def test_explain_select(self) -> None:
+        """Phase 24: EXPLAIN SELECT 输出执行策略。"""
+        schema = Schema(fields=[("id", "INT"), ("name", "VARCHAR(32)")])
+        table = RowTable(schema, primary_key="id")
+        execute_sql("INSERT INTO t (id, name) VALUES (1, 'a')", table)
+        execute_sql("INSERT INTO t (id, name) VALUES (2, 'b')", table)
+
+        msg, rows, cols = execute_sql("EXPLAIN SELECT * FROM t WHERE id >= 1 AND id <= 10", table)
+        assert "(explain)" in msg
+        assert cols == ["item", "value"]
+        by_item = dict((r[0], r[1]) for r in rows)
+        assert by_item["Query Type"] == "SELECT"
+        assert by_item["Execution Strategy"] in ("TABLE_SCAN", "INDEX_SCAN")
+        assert "Filter Predicates" in by_item
+
+    def test_explain_insert(self) -> None:
+        """Phase 24: EXPLAIN INSERT 输出。"""
+        schema = Schema(fields=[("id", "INT"), ("name", "VARCHAR(32)")])
+        table = RowTable(schema, primary_key="id")
+        msg, rows, _ = execute_sql("EXPLAIN INSERT INTO t (id, name) VALUES (1, 'x')", table)
+        assert "(explain)" in msg
+        by_item = dict((r[0], r[1]) for r in rows)
+        assert by_item["Query Type"] == "INSERT"
+        assert by_item["Target Table"] == "t"
 
 
 class TestCreateTable:
@@ -299,6 +325,60 @@ class TestPhase19Savepoints:
 
         rb = parse_sql("ROLLBACK TO my_sp")
         assert hasattr(rb, "name") and rb.name == "my_sp"
+
+
+class TestFailoverPromotion:
+    """Phase 25: Slave 无心跳 5 秒后 promote_to_master。"""
+
+    def test_failover_promotion(self) -> None:
+        """Slave 连接后若 Master 无 WAL 推送超过 failover 超时，触发 promote。"""
+        import socket
+        import struct
+        import threading
+        import time
+
+        from bplus_tree.schema import Schema
+        from bplus_tree.table import RowTable
+        from bplus_tree.replication import ReplicationSubscriber
+
+        schema = Schema(fields=[("id", "INT"), ("v", "VARCHAR(8)")])
+        table = RowTable(schema, primary_key="id")
+        tables = {"t": table}
+        replication_info: dict[str, Any] = {"node_role": "SLAVE"}
+
+        # Mock master: send one WAL line then close (simulates Master dying)
+        sent = threading.Event()
+
+        def mock_master() -> None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            sock.listen(1)
+            sent.port = port
+            conn, _ = sock.accept()
+            msg = b"t\tTX_BEGIN 1\n"
+            conn.sendall(struct.pack("<I", len(msg)) + msg)
+            conn.close()
+            sock.close()
+            sent.set()
+
+        t = threading.Thread(target=mock_master)
+        t.start()
+        time.sleep(0.1)
+        port = sent.port
+
+        subscriber = ReplicationSubscriber(
+            "127.0.0.1",
+            port,
+            tables,
+            replication_info_ref=replication_info,
+            failover_timeout_sec=0.3,
+        )
+        subscriber.start()
+        t.join(timeout=2.0)
+        time.sleep(0.5)
+        assert replication_info.get("node_role") == "MASTER"
 
 
 class TestBufferPoolPersistence:

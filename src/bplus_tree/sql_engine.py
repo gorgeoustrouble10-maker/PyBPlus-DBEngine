@@ -65,6 +65,7 @@ class ParsedSelect:
     where: Optional[str] = None
     start_key: Optional[Any] = None
     end_key: Optional[Any] = None
+    in_values: Optional[list[Any]] = None  # WHERE col IN (v1, v2, ...)
     order_by_col: Optional[str] = None
     order_desc: bool = False  # True = DESC, False = ASC
     limit: Optional[int] = None
@@ -133,9 +134,20 @@ class ParsedRollbackTo:
     name: str
 
 
+@dataclass
+class ParsedExplain:
+    """
+    English: Parsed EXPLAIN <SQL>; inner is the wrapped statement.
+    Chinese: 解析后的 EXPLAIN <SQL>；inner 为内层语句。
+    Japanese: パース済み EXPLAIN <SQL>；inner は内包文。
+    """
+    inner_sql: str
+    inner_parsed: "ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable"
+
+
 def parse_sql(
     sql: str,
-) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSavepoint | ParsedRollbackTo:
+) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSavepoint | ParsedRollbackTo | ParsedExplain:
     """
     English: Parse SQL string; malformed SQL returns 1064 Syntax Error, never crashes.
     Chinese: 解析 SQL；畸形 SQL 返回 1064 语法错误，不会导致进程崩溃。
@@ -151,13 +163,24 @@ def parse_sql(
 
 def _parse_sql_impl(
     sql: str,
-) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSavepoint | ParsedRollbackTo:
+) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSavepoint | ParsedRollbackTo | ParsedExplain:
     """Internal parse; exceptions converted by parse_sql."""
     sql = sql.strip().rstrip(";").strip()
     if not sql:
         raise EmptySQLError()
 
     upper = sql.upper()
+    if upper.startswith("EXPLAIN "):
+        inner = sql[7:].strip().rstrip(";").strip()
+        if not inner:
+            raise SQLSyntaxError("EXPLAIN requires an inner SQL statement")
+        inner_parsed = _parse_sql_impl(inner)
+        if not isinstance(
+            inner_parsed,
+            (ParsedSelect, ParsedInsert, ParsedDelete, ParsedCreateTable, ParsedDropTable),
+        ):
+            raise SQLSyntaxError("EXPLAIN only supports SELECT, INSERT, DELETE, CREATE TABLE, DROP TABLE")
+        return ParsedExplain(inner_sql=inner, inner_parsed=inner_parsed)
     if upper.startswith("CREATE TABLE"):
         return _parse_create_table(sql)
     if upper.startswith("DROP TABLE"):
@@ -281,18 +304,40 @@ def _parse_select(sql: str) -> ParsedSelect:
     if is_count:
         columns = ["COUNT(*)"]
     start_key, end_key = _parse_where_range(where) if where else (None, None)
+    in_values = _parse_where_in(where) if where else None
     return ParsedSelect(
         columns=columns,
         table=table,
         where=where,
         start_key=start_key,
         end_key=end_key,
+        in_values=in_values,
         order_by_col=order_by_col,
         order_desc=order_desc,
         limit=limit,
         offset=offset,
         is_count=is_count,
     )
+
+
+def _parse_where_in(where: Optional[str]) -> Optional[list[Any]]:
+    """
+    English: Extract values from WHERE col IN (v1, v2, v3).
+    Chinese: 从 WHERE col IN (v1, v2, v3) 提取值列表。
+    Japanese: WHERE col IN (v1, v2, v3) から値を抽出。
+    """
+    if not where:
+        return None
+    m = re.search(r"(\w+)\s+IN\s*\(\s*(.+?)\s*\)", where, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+    vals_str = m.group(2).strip()
+    result: list[Any] = []
+    for part in re.split(r",\s*(?![^(]*\))", vals_str):
+        part = part.strip()
+        if part:
+            result.append(_parse_value(part))
+    return result if result else None
 
 
 def _parse_where_range(where: str) -> tuple[Optional[Any], Optional[Any]]:
@@ -444,8 +489,75 @@ def _parse_delete(sql: str) -> ParsedDelete:
     return ParsedDelete(table=table, where=where, pk_value=pk_value)
 
 
+def _build_explain_output(
+    parsed: ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable,
+    db: Optional[Any],
+    table: Optional[Any],
+) -> tuple[str, list[list[Any]], Optional[list[str]]]:
+    """
+    English: Build EXPLAIN output without executing.
+    Chinese: 构建 EXPLAIN 输出，不实际执行。
+    Japanese: 実行せず EXPLAIN 出力を構築。
+    """
+    def _get_table(name: str) -> Any:
+        if db is not None:
+            return db.get_table(name)
+        if table is None:
+            raise UnknownTableError(name)
+        return table
+
+    rows: list[list[Any]] = []
+    if isinstance(parsed, ParsedSelect):
+        query_type = "SELECT"
+        tbl = _get_table(parsed.table)
+        if parsed.in_values is not None:
+            lo, hi = "IN(...)", f"IN({len(parsed.in_values)} vals)"
+            strategy = "INDEX_SCAN"
+            est_range = len(parsed.in_values)
+        else:
+            lo = parsed.start_key if parsed.start_key is not None else "(-inf)"
+            hi = parsed.end_key if parsed.end_key is not None else "(+inf)"
+            strategy = tbl.choose_strategy(
+                parsed.start_key if parsed.start_key is not None else -(2**63),
+                parsed.end_key if parsed.end_key is not None else (2**63 - 1),
+            )
+            lo_n = parsed.start_key if parsed.start_key is not None else -(2**63)
+            hi_n = parsed.end_key if parsed.end_key is not None else (2**63 - 1)
+            est_range = (
+                max(0, int(hi_n) - int(lo_n) + 1)
+                if isinstance(lo_n, (int, float)) and isinstance(hi_n, (int, float))
+                else tbl._total_rows
+            )
+        scan_range = f"[{lo}, {hi}]" if strategy == "INDEX_SCAN" else "FULL"
+        filter_pred = parsed.where if parsed.where else "none"
+        cost_table = tbl.compute_cost_table_scan()
+        cost_index = tbl.compute_cost_index_scan(est_range)
+        rows = [
+            ["Query Type", query_type],
+            ["Execution Strategy", strategy],
+            ["Scan Range", str(scan_range)],
+            ["Filter Predicates", str(filter_pred)],
+            ["Cost_TableScan", f"{cost_table:.1f}"],
+            ["Cost_IndexScan", f"{cost_index:.1f}"],
+            ["Estimated_Range_Rows", est_range],
+        ]
+    elif isinstance(parsed, ParsedInsert):
+        rows = [["Query Type", "INSERT"], ["Target Table", parsed.table]]
+    elif isinstance(parsed, ParsedDelete):
+        rows = [
+            ["Query Type", "DELETE"],
+            ["Target Table", parsed.table],
+            ["Filter Predicates", str(parsed.where) if parsed.where else "pk only"],
+        ]
+    elif isinstance(parsed, ParsedCreateTable):
+        rows = [["Query Type", "CREATE TABLE"], ["Target Table", parsed.table]]
+    elif isinstance(parsed, ParsedDropTable):
+        rows = [["Query Type", "DROP TABLE"], ["Target Table", parsed.table]]
+    return ("(explain)", rows, ["item", "value"])
+
+
 def _execute_show_stats(
-    db: Optional[Any], tx_manager: Optional[Any]
+    db: Optional[Any], tx_manager: Optional[Any], replication_info: Optional[dict[str, Any]] = None
 ) -> tuple[str, list[list[Any]], Optional[list[str]]]:
     """
     English: Execute SHOW STATS; buffer hit rate, active tx count, table files and sizes.
@@ -477,6 +589,20 @@ def _execute_show_stats(
                         if p.exists():
                             size += p.stat().st_size
                 rows.append([f"table_{tname}_bytes", size])
+
+    if replication_info is not None:
+        rows.append(["node_role", replication_info.get("node_role", "STANDALONE")])
+        get_lag = replication_info.get("get_lag")
+        lag_str = "N/A"
+        if callable(get_lag):
+            try:
+                s = get_lag()
+                lag_str = f"{s:.3f}s" if s == s else "N/A"
+            except Exception:
+                lag_str = "N/A"
+        elif "replication_lag" in replication_info:
+            lag_str = str(replication_info["replication_lag"])
+        rows.append(["replication_lag", lag_str])
     return ("(stats)", rows, ["metric", "value"])
 
 
@@ -499,6 +625,7 @@ def execute_sql(
     db: Optional[Any] = None,
     tx: Optional[Any] = None,
     tx_manager: Optional[Any] = None,
+    replication_info: Optional[dict[str, Any]] = None,
 ) -> tuple[str, list[list[Any]], Optional[list[str]]]:
     """
     English: Execute SQL; use db for multi-table/CREATE, tx_manager for SHOW STATS.
@@ -537,8 +664,11 @@ def execute_sql(
         rows = [[n] for n in names]
         return (f"({len(rows)} tables)", rows, ["Tables"])
 
+    if isinstance(parsed, ParsedExplain):
+        return _build_explain_output(parsed.inner_parsed, db, table)
+
     if isinstance(parsed, ParsedShowStats):
-        return _execute_show_stats(db, tx_manager)
+        return _execute_show_stats(db, tx_manager, replication_info)
 
     if isinstance(parsed, ParsedShowHealth):
         return ("OK", [["status", "OK"]], ["metric", "value"])
@@ -561,6 +691,7 @@ def execute_sql(
             lambda _: True,
             start_key=parsed.start_key,
             end_key=parsed.end_key,
+            in_values=parsed.in_values,
             read_view=read_view,
         ):
             select_rows.append([r.get_field(n) for n in names])

@@ -1,16 +1,28 @@
 """
-表与行存储：Tuple、insert_row、scan_with_condition。
+表与行存储：Tuple、insert_row、scan_with_condition、TableStats、CBO 代价模型。
 
-English: Table and row storage; Tuple, insert_row, scan with filter.
-Chinese: 表与行存储：元组、按行插入、条件扫描。
-Japanese: テーブルと行ストレージ：タプル、行挿入、条件付きスキャン。
+English: Table and row storage; Tuple, insert_row, scan with filter, TableStats, CBO cost model.
+Chinese: 表与行存储：元组、按行插入、条件扫描、表统计、CBO 代价模型。
+Japanese: テーブルと行ストレージ：タプル、行挿入、条件付きスキャン、TableStats、CBO コストモデル。
 """
 
 import struct
+from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
 from bplus_tree.schema import Schema
 from bplus_tree.tree import BPlusTree
+
+
+@dataclass
+class TableStats:
+    """
+    English: Table statistics for CBO; total_rows and index cardinality.
+    Chinese: 表统计信息；总行数与索引唯一值分布。
+    Japanese: CBO 用テーブル統計；総行数とインデックス基数。
+    """
+    total_rows: int = 0
+    index_cardinality: int = 0  # 主键唯一值数，通常等于 total_rows
 
 
 class Tuple:
@@ -144,6 +156,7 @@ class RowTable:
         self._tx_manager = tx_manager
         self._total_rows: int = 0
         self._index_unique_counts: dict[str, int] = {}
+        self._stats = TableStats()
 
     def insert_row(
         self,
@@ -169,6 +182,8 @@ class RowTable:
             transaction.log_insert_undo(key, raw, table=self)
         self._tree.insert(key, raw)
         self._total_rows += 1
+        self._stats.total_rows = self._total_rows
+        self._stats.index_cardinality = self._total_rows
 
     def delete_row(
         self,
@@ -188,6 +203,20 @@ class RowTable:
             transaction.log_delete_undo(key, raw, table=self)
         self._tree.delete(key)
         self._total_rows = max(0, self._total_rows - 1)
+        self._stats.total_rows = self._total_rows
+        self._stats.index_cardinality = self._total_rows
+
+    def compute_cost_table_scan(self) -> float:
+        """Cost_TableScan = total_rows * 1.0"""
+        return float(self._total_rows) * 1.0
+
+    def compute_cost_index_scan(
+        self,
+        estimated_range_rows: int,
+        index_seek_cost: float = 10.0,
+    ) -> float:
+        """Cost_IndexScan = estimated_range_rows * 0.5 + index_seek_cost"""
+        return float(estimated_range_rows) * 0.5 + index_seek_cost
 
     def choose_strategy(
         self,
@@ -195,48 +224,68 @@ class RowTable:
         end_key: Any,
     ) -> str:
         """
-        English: CBO-Lite: choose TABLE_SCAN if range > 30% of table, else INDEX_SCAN.
-        Chinese: 代价优化器：若扫描范围超过 30% 则 TABLE_SCAN，否则 INDEX_SCAN。
-        Japanese: CBO-Lite：スキャン範囲が 30% 超なら TABLE_SCAN、否則 INDEX_SCAN。
+        English: CBO with cost model; force TABLE_SCAN if IndexScan cost > TableScan cost.
+        Chinese: 基于代价模型；若 IndexScan 代价高于 TableScan 则强制 TABLE_SCAN。
+        Japanese: コストモデルベース；IndexScan コスト > TableScan なら TABLE_SCAN を強制。
 
         Returns:
             "TABLE_SCAN" or "INDEX_SCAN"
         """
         if self._total_rows <= 0:
             return "INDEX_SCAN"
+        cost_table = self.compute_cost_table_scan()
         if isinstance(start_key, int) and isinstance(end_key, int):
-            scan_range = max(0, end_key - start_key + 1)
+            estimated_range = max(0, end_key - start_key + 1)
         else:
-            scan_range = self._total_rows
-        if scan_range / self._total_rows > 0.3:
+            estimated_range = self._total_rows
+        cost_index = self.compute_cost_index_scan(estimated_range)
+        if cost_index > cost_table:
+            return "TABLE_SCAN"
+        if estimated_range / self._total_rows > 0.3:
             return "TABLE_SCAN"
         return "INDEX_SCAN"
 
     def refresh_stats(self) -> None:
         """
-        English: Recompute total_rows from range scan (e.g. after load).
-        Chinese: 从范围扫描重新计算 total_rows（如加载后）。
-        Japanese: 範囲スキャンから total_rows を再計算（ロード後など）。
+        English: Recompute total_rows and index_cardinality from range scan (e.g. after load).
+        Chinese: 从范围扫描重新计算 total_rows 与 index_cardinality（如加载后）。
+        Japanese: 範囲スキャンから total_rows と index_cardinality を再計算（ロード後など）。
         """
         self._total_rows = sum(
             1 for _ in self._tree.range_scan(-(2**63), 2**63 - 1)
         )
+        self._stats.total_rows = self._total_rows
+        self._stats.index_cardinality = self._total_rows
 
     def scan_with_condition(
         self,
         condition: Callable[[Tuple], bool],
         start_key: Optional[Any] = None,
         end_key: Optional[Any] = None,
+        in_values: Optional[list[Any]] = None,
         read_view: Optional[Any] = None,
     ) -> Iterator[Tuple]:
         """
-        English: Scan rows in key range; CBO chooses TABLE_SCAN vs INDEX_SCAN; optionally filter by ReadView.
-        Chinese: 扫描键范围内行；CBO 自动选择 TABLE_SCAN/INDEX_SCAN；可选按 ReadView 过滤。
-        Japanese: キー範囲内の行をスキャン；CBO で TABLE_SCAN/INDEX_SCAN を自動選択；ReadView で可視性フィルタ。
+        English: Scan rows in key range or IN values; CBO chooses TABLE_SCAN vs INDEX_SCAN; optionally filter by ReadView.
+        Chinese: 扫描键范围内或 IN 多值行；CBO 自动选择 TABLE_SCAN/INDEX_SCAN；可选按 ReadView 过滤。
+        Japanese: キー範囲または IN 値でスキャン；CBO で TABLE_SCAN/INDEX_SCAN を自動選択；ReadView で可視性フィルタ。
 
         Args:
+            in_values: If provided, do point lookups for each value (WHERE col IN (v1,v2)).
             read_view: If provided, only rows visible to this ReadView are yielded.
         """
+        if in_values is not None and in_values:
+            for k in in_values:
+                raw = self._tree.search(k)
+                if raw is None:
+                    continue
+                row = Tuple(self._schema, raw=raw)
+                if read_view is not None and not read_view.is_visible(row.tx_id):
+                    continue
+                if condition(row):
+                    yield row
+            return
+
         lo: Any = start_key if start_key is not None else -(2**63)
         hi: Any = end_key if end_key is not None else (2**63 - 1)
         strategy = self.choose_strategy(lo, hi)
