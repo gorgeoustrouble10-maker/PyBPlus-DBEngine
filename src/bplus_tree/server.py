@@ -140,12 +140,17 @@ class DBRequestHandler(socketserver.BaseRequestHandler):
                         self._send_error("[1064] No active transaction for SAVEPOINT")
                     continue
 
+                repl_info = getattr(self.server, "replication_info", None)
                 if db is not None:
                     msg, rows, columns = execute_sql(
-                        sql, db=db, tx=self._tx, tx_manager=tx_manager
+                        sql, db=db, tx=self._tx, tx_manager=tx_manager,
+                        replication_info=repl_info,
                     )
                 else:
-                    msg, rows, columns = execute_sql(sql, table=table, tx=self._tx)
+                    msg, rows, columns = execute_sql(
+                        sql, table=table, tx=self._tx,
+                        replication_info=repl_info,
+                    )
                 payload = _encode_response_correct("OK", msg, rows, columns)
                 self._send_raw(payload)
             except socket.timeout:
@@ -205,6 +210,7 @@ class DBServer(socketserver.ThreadingTCPServer):
     tx_manager: Optional[Any] = None
     db: Optional[Any] = None
     password: Optional[str] = None
+    replication_info: Optional[dict[str, Any]] = None
 
 
 def run_server(
@@ -213,6 +219,7 @@ def run_server(
     host: str = "127.0.0.1",
     port: int = 8765,
     password: Optional[str] = None,
+    replication_info: Optional[dict[str, Any]] = None,
 ) -> None:
     """
     English: Start multi-threaded TCP server; use db (with recovery) or table.
@@ -227,6 +234,7 @@ def run_server(
         server.db = db
         server.tx_manager = TransactionManager()
         server.password = password
+        server.replication_info = replication_info
         server.daemon_threads = True
         server.allow_reuse_address = True
         logging.info("PyBPlus-DB Server on %s:%d", host, port)
@@ -238,6 +246,8 @@ def run_server_with_recovery(
     host: str = "127.0.0.1",
     port: int = 8765,
     password: str | None = None,
+    replication_port: Optional[int] = None,
+    slave_of: Optional[str] = None,
 ) -> None:
     """
     English: Start server with Catalog + WAL recovery; CREATE TABLE supported.
@@ -245,8 +255,31 @@ def run_server_with_recovery(
     Japanese: Catalog と WAL リカバリでサーバーを起動；CREATE TABLE 対応。
     """
     from bplus_tree.database_context import DatabaseContext
+    from bplus_tree.replication import ReplicationPublisher, ReplicationSubscriber
 
     ctx = DatabaseContext(Path(data_dir) if not isinstance(data_dir, Path) else data_dir)
     ctx.load_tables()
     ctx.run_recovery()
-    run_server(db=ctx, host=host, port=port, password=password)
+
+    replication_info: dict[str, Any] = {}
+    publisher: Any = None
+    subscriber: Any = None
+
+    if slave_of:
+        parts = slave_of.rsplit(":", 1)
+        master_addr = parts[0] if parts else "127.0.0.1"
+        master_port = int(parts[1]) if len(parts) > 1 else 8767
+        replication_info["node_role"] = "SLAVE"
+        subscriber = ReplicationSubscriber(
+            master_addr, master_port, ctx.get_tables(),
+            replication_info_ref=replication_info,
+        )
+        subscriber.start()
+        replication_info["get_lag"] = lambda: subscriber.replication_lag
+    elif replication_port is not None:
+        replication_info["node_role"] = "MASTER"
+        replication_info["replication_lag"] = "N/A"
+        publisher = ReplicationPublisher(ctx._data_dir, ctx.get_tables(), replication_port)
+        publisher.start()
+
+    run_server(db=ctx, host=host, port=port, password=password, replication_info=replication_info)

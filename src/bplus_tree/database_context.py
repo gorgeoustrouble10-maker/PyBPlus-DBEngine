@@ -141,6 +141,8 @@ class DatabaseContext:
         Japanese: wal.log または wal_{name}.log が存在すればリプレイ。
         """
         run_recovery(self._data_dir, self._tables)
+        for t in self._tables.values():
+            t.refresh_stats()
 
     def create_table(
         self,

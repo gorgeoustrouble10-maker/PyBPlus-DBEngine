@@ -24,10 +24,19 @@ def main() -> None:
     parser.add_argument("-P", "--port", type=int, default=8765, help="Bind port")
     parser.add_argument("-d", "--data-dir", default=None, help="Data directory; enables catalog + WAL recovery")
     parser.add_argument("--password", default=None, help="Require AUTH <password> as first message")
+    parser.add_argument("--replication-port", type=int, default=None, help="Master: listen for replication on this port (e.g. 8767)")
+    parser.add_argument("--slave-of", default=None, help="Slave: replicate from master (e.g. 127.0.0.1:8767)")
     args = parser.parse_args()
 
     if args.data_dir:
-        run_server_with_recovery(args.data_dir, host=args.host, port=args.port, password=args.password)
+        run_server_with_recovery(
+            args.data_dir,
+            host=args.host,
+            port=args.port,
+            password=args.password,
+            replication_port=args.replication_port,
+            slave_of=args.slave_of,
+        )
     else:
         schema = Schema(fields=[("id", "INT"), ("name", "VARCHAR(32)"), ("score", "FLOAT")])
         table = RowTable(schema, primary_key="id")
