@@ -496,6 +496,60 @@ class TestSemiSyncConsistency:
             shutil.rmtree(d, ignore_errors=True)
 
 
+class TestPhase26bJoin:
+    """Phase 26b: Nested Loop Join、EXPLAIN JOIN、AST 解析。"""
+
+    def test_join_nested_loop(self) -> None:
+        """SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id"""
+        import tempfile
+        from pathlib import Path
+
+        from bplus_tree.database_context import DatabaseContext
+        from bplus_tree.sql_engine import execute_sql, parse_sql
+
+        with tempfile.TemporaryDirectory() as d:
+            ctx = DatabaseContext(Path(d))
+            execute_sql("CREATE TABLE t1 (id INT, a VARCHAR(8))", db=ctx)
+            execute_sql("CREATE TABLE t2 (id INT, b VARCHAR(8))", db=ctx)
+            execute_sql("INSERT INTO t1 (id, a) VALUES (1, 'x')", db=ctx)
+            execute_sql("INSERT INTO t1 (id, a) VALUES (2, 'y')", db=ctx)
+            execute_sql("INSERT INTO t2 (id, b) VALUES (1, 'p')", db=ctx)
+            execute_sql("INSERT INTO t2 (id, b) VALUES (2, 'q')", db=ctx)
+
+            msg, rows, cols = execute_sql(
+                "SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id",
+                db=ctx,
+            )
+            assert len(rows) == 2
+            by_a = {r[0]: r[1] for r in rows}
+            assert by_a.get("x") == "p"
+            assert by_a.get("y") == "q"
+
+    def test_explain_join(self) -> None:
+        """EXPLAIN SELECT ... JOIN 展示执行顺序与代价"""
+        import tempfile
+        from pathlib import Path
+
+        from bplus_tree.database_context import DatabaseContext
+        from bplus_tree.sql_engine import execute_sql
+
+        with tempfile.TemporaryDirectory() as d:
+            ctx = DatabaseContext(Path(d))
+            execute_sql("CREATE TABLE t1 (id INT, a INT)", db=ctx)
+            execute_sql("CREATE TABLE t2 (id INT, b INT)", db=ctx)
+            execute_sql("INSERT INTO t1 (id, a) VALUES (1, 10)", db=ctx)
+            execute_sql("INSERT INTO t2 (id, b) VALUES (1, 20)", db=ctx)
+
+            msg, rows, cols = execute_sql(
+                "EXPLAIN SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id",
+                db=ctx,
+            )
+            by_item = {r[0]: r[1] for r in rows}
+            assert "SELECT (JOIN)" in str(by_item.get("Query Type", ""))
+            assert "NESTED_LOOP_JOIN" in str(by_item.get("Join Type", ""))
+            assert "Join Condition" in by_item
+
+
 class TestSetGlobal:
     """Phase 26a: SET GLOBAL replication_type。"""
 

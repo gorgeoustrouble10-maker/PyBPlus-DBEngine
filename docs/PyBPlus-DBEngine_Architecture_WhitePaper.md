@@ -4,9 +4,9 @@
 
 ---
 
-**Version**: 2.2  
+**Version**: 2.3  
 **Date**: 2026  
-**Status**: Phase 1–Phase 26a (Semi-Sync Replication, ACK Logic)
+**Status**: Phase 1–Phase 26b (AST Parser, Nested Loop Join)
 
 ---
 
@@ -30,6 +30,7 @@
 16. [Phase 24: Query Profiling & WAL Replication | Phase 24：执行计划分析与主从同步](#16-phase-24-query-profiling--wal-replication)
 17. [Phase 25: Cost Estimation & Auto-Failover | Phase 25：代价模型与自动故障转移](#17-phase-25-cost-estimation--auto-failover)
 18. [Phase 26a: Semi-Sync Replication | Phase 26a：半同步复制与一致性增强](#18-phase-26a-semi-sync-replication)
+19. [Phase 26b: AST Parser & Nested Loop Join | Phase 26b：AST 解析与嵌套循环关联](#19-phase-26b-ast-parser--nested-loop-join)
 
 ---
 
@@ -814,6 +815,72 @@ SET GLOBAL replication_type = 'ASYNC'
 
 ---
 
+## 19. Phase 26b: AST Parser & Nested Loop Join
+## Phase 26b：基于 AST 的解析重构与关联查询试点
+## Phase 26b：AST ベースのパースリファクタリングと JOIN パイロット
+
+### 19.1 基于 AST 的执行计划树 | AST-Based Execution Plan Tree
+### 基于 AST の実行計画ツリー
+
+**Parse → Plan → Execute 三阶段**：
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│   Parse     │ ──► │      Plan        │ ──► │    Execute      │
+│ (sqlglot)   │     │ (ParsedSelect/   │     │ (scan/join/     │
+│ SELECT/INSERT│    │  ParsedInsert)   │     │  insert)        │
+└─────────────┘     └──────────────────┘     └─────────────────┘
+```
+
+- **Parse**：使用 sqlglot 解析 SELECT、INSERT，生成 AST；从 AST 提取字段、表名、WHERE、JOIN 条件。
+- **Plan**：ParsedSelect / ParsedInsert 即为执行计划；JOIN 时含 join_tables、join_on。
+- **Execute**：单表走 scan_with_condition；JOIN 走 _execute_join（Nested Loop）。
+
+SHOW TABLES、SAVEPOINT 等仍用正则解析；SELECT/INSERT 优先 AST，失败时回退正则。
+
+### 19.2 Nested Loop Join 物理执行过程 | Nested Loop Join Physical Execution
+### ネステッドループ JOIN 物理実行プロセス
+
+```mermaid
+flowchart TD
+    subgraph CBO["CBO: 小表驱动大表"]
+        A[比较 t1、t2 行数] --> B{n1 ≤ n2?}
+        B -->|是| C[Outer = t1, Inner = t2]
+        B -->|否| D[Outer = t2, Inner = t1]
+    end
+
+    subgraph NLJ["Nested Loop Join"]
+        C --> E[遍历 Outer 表每行]
+        D --> E
+        E --> F[取 join_key 值]
+        F --> G[Inner 表 index 查找]
+        G --> H{匹配?}
+        H -->|是| I[输出拼接行]
+        H -->|否| E
+        I --> E
+    end
+```
+
+**说明**：
+- 外层循环遍历小表（Outer），内层按 join 键在另一表（Inner）上做 `tree.search` 索引查找。
+- 语法：`SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id`
+- EXPLAIN 输出：Join Type、Outer Table、Inner Table、Join Condition、Cost_Outer、Cost_Inner_IndexLookup。
+
+### 19.3 EXPLAIN JOIN 输出 | EXPLAIN JOIN Output
+### EXPLAIN JOIN 出力
+
+| 项 | 说明 |
+|------|------|
+| Query Type | SELECT (JOIN) |
+| Join Type | NESTED_LOOP_JOIN |
+| Outer Table | 小表（行数少） |
+| Inner Table | 大表，按 join 键索引查找 |
+| Join Condition | t1.id = t2.id |
+| Cost_Outer | 外层全表扫描代价 |
+| Cost_Inner_IndexLookup | 内层索引查找代价 |
+
+---
+
 ## References
 ## 参考文献
 ## 参考文献
@@ -824,9 +891,9 @@ SET GLOBAL replication_type = 'ASYNC'
 
 ---
 
-*Document generated from Phase 1–Phase 26a implementation.  
-本白皮书基于 Phase 1 至 Phase 26a 的完整实现生成。  
-Phase 1〜Phase 26a の実装に基づいて本ホワイトペーパーを生成しました。*
+*Document generated from Phase 1–Phase 26b implementation.  
+本白皮书基于 Phase 1 至 Phase 26b 的完整实现生成。  
+Phase 1〜Phase 26b の実装に基づいて本ホワイトペーパーを生成しました。*
 
 ---
 
