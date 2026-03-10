@@ -4,9 +4,9 @@
 
 ---
 
-**Version**: 2.3  
+**Version**: 2.4  
 **Date**: 2026  
-**Status**: Phase 1–Phase 26b (AST Parser, Nested Loop Join)
+**Status**: Phase 1–Phase 27 (Storage Abstraction, Bloom Filter Optimization)
 
 ---
 
@@ -31,6 +31,7 @@
 17. [Phase 25: Cost Estimation & Auto-Failover | Phase 25：代价模型与自动故障转移](#17-phase-25-cost-estimation--auto-failover)
 18. [Phase 26a: Semi-Sync Replication | Phase 26a：半同步复制与一致性增强](#18-phase-26a-semi-sync-replication)
 19. [Phase 26b: AST Parser & Nested Loop Join | Phase 26b：AST 解析与嵌套循环关联](#19-phase-26b-ast-parser--nested-loop-join)
+20. [Phase 27: Storage Abstraction & Bloom Filter | Phase 27：存储抽象与布隆过滤器](#20-phase-27-storage-abstraction--bloom-filter)
 
 ---
 
@@ -881,19 +882,105 @@ flowchart TD
 
 ---
 
+## 20. Phase 27: Storage Abstraction & Bloom Filter
+## Phase 27：存储抽象化与布隆过滤器加速
+## Phase 27：ストレージ抽象化とブルームフィルタ最適化
+
+### 20.1 存储引擎抽象 | Storage Engine Abstraction | ストレージエンジン抽象
+
+**目标**：实现存储引擎可插拔架构，将 B+ 树逻辑与上层 Table 解耦。
+
+**StorageEngine 协议**（`storage_engine.py`）：
+
+| 方法 | 说明 |
+|------|------|
+| **search(key)** | 点查，返回 value 或 None |
+| **insert(key, value)** | 插入键值对 |
+| **delete(key)** | 按 key 删除，不存在则 KeyError |
+| **range_scan(start_key, end_key)** | 范围扫描，迭代 (key, value) |
+
+**BPlusTreeEngine**：包装现有 `BPlusTree`，实现上述接口；暴露 `.tree` 属性供持久化、复制等兼容使用。
+
+**数据流**：`RowTable` 持有 `_engine: StorageEngine`（默认 `BPlusTreeEngine`），所有 search/insert/delete/scan 经引擎执行。
+
+### 20.2 内存布隆过滤器 | In-Memory Bloom Filter | メモリブルームフィルタ
+
+**逻辑**：在执行 `BPlusTree.search` 前先咨询布隆过滤器。若 `may_contain(key) == False`，则**一定不存在**，直接返回空结果，跳过 BufferPool/磁盘查询。
+
+**实现**（`bloom_filter.py`）：
+- 位数组（默认 8192 bits = 1KB）
+- k 个哈希函数（默认 3），基于 SHA256 切片
+- `add(key)`：插入时维护
+- `may_contain(key)`：False 表示一定不存在；True 表示可能存在（需底层确认）
+
+**集成**：`RowTable` 新增 `_bloom_filter`、`enable_bloom_filter` 参数；`_point_lookup` 先查布隆过滤器；`apply_insert`/`apply_delete` 同步更新过滤器；`refresh_stats()` 可重建过滤器（遍历 range_scan 并 add）。
+
+### 20.3 布隆过滤器在点查优化中的数学原理
+### Mathematical Principles of Bloom Filter in Point Lookup Optimization
+### 点検索最適化におけるブルームフィルタの数学原理
+
+**问题设定**：海量点查场景下，若大量查询的 key 实际不存在，每次都会触发 B+ 树遍历乃至磁盘 I/O。布隆过滤器可在 O(1) 内存访问内判定“一定不存在”，从而跳过昂贵查询。
+
+**假阳性率（False Positive Rate）**：
+
+设位数组大小为 \(m\)，已插入 \(n\) 个元素，使用 \(k\) 个哈希函数。单次哈希将某位设为 1 的概率为 \(1/m\)，未设为 1 的概率为 \(1 - 1/m\)。插入 \(n\) 个元素、每个用 \(k\) 次哈希后，某特定位仍为 0 的概率为：
+
+$$P_0 = \left(1 - \frac{1}{m}\right)^{kn} \approx e^{-kn/m}$$
+
+假阳性率：当查询一个不存在的 key 时，其 \(k\) 个哈希位**全部**已被其他元素置 1 的概率：
+
+$$f = \left(1 - P_0\right)^k = \left(1 - e^{-kn/m}\right)^k$$
+
+**最优 k**：给定 \(m/n\) 比值，使 \(f\) 最小的 \(k\) 为：
+
+$$k_{opt} = \frac{m}{n} \ln 2 \approx 0.693 \cdot \frac{m}{n}$$
+
+此时假阳性率约为 \(f \approx (0.6185)^{m/n}\)。
+
+**空间与精度折中**：
+
+| \(m/n\) (bits per element) | 最优 k | 假阳性率 \(f\) |
+|----------------------------|--------|----------------|
+| 8 | 6 | ~2.1% |
+| 12 | 8 | ~0.3% |
+| 16 | 11 | ~0.05% |
+
+**点查收益**：设点查中“key 不存在”的比例为 \(p_{absent}\)，每次底层查询成本为 \(C\)，布隆过滤器单次检查成本为 \(c \ll C\)。则：
+
+- **无过滤器**：每次查询成本 \(C\)
+- **有过滤器**：\(p_{absent}\) 比例直接返回，成本 \(c\)；\(1 - p_{absent}\) 比例需底层查询，成本 \(c + C\)；假阳性额外带来 \(f \cdot p_{absent}\) 比例的冗余底层查询
+
+期望成本（忽略假阳性时）：
+$$\mathbb{E}[\text{cost}] \approx p_{absent} \cdot c + (1 - p_{absent}) \cdot (c + C)$$
+
+当 \(p_{absent}\) 较大（如 50%）且 \(C \gg c\)（磁盘 I/O）时，可显著降低平均延迟与 IOPS。
+
+**实现参数**：当前 `BloomFilter` 默认 \(m=8192\)、\(k=3\)；对 \(n \approx 5000\) 时 \(m/n \approx 1.6\)，假阳性率较高；可通过 `num_bits`、`num_hashes` 调优。
+
+### 20.4 基准测试 | Benchmark | ベンチマーク
+
+**脚本**：`scripts/benchmark_filter.py`
+
+- 插入 5,000 条，执行 10,000 次随机点查（50% 不存在的 Key）
+- 对比 `enable_bloom_filter=True` 与 `False` 的耗时
+
+**说明**：纯内存模式下，B+ 树查找极快，布隆过滤器的哈希与位检查可能带来净开销；**有磁盘 I/O 时**（BufferPool 未命中、持久化表），布隆过滤器可大幅减少不必要的页读取。
+
+---
+
 ## References
 ## 参考文献
 ## 参考文献
 
 - PyBPlus-DBEngine 源码：`src/bplus_tree/`
-- 基准脚本：`scripts/benchmark.py`、`scripts/benchmark_concurrency.py`
+- 基准脚本：`scripts/benchmark.py`、`scripts/benchmark_concurrency.py`、`scripts/benchmark_filter.py`
 - 测试：`tests/test_*.py`
 
 ---
 
-*Document generated from Phase 1–Phase 26b implementation.  
-本白皮书基于 Phase 1 至 Phase 26b 的完整实现生成。  
-Phase 1〜Phase 26b の実装に基づいて本ホワイトペーパーを生成しました。*
+*Document generated from Phase 1–Phase 27 implementation.  
+本白皮书基于 Phase 1 至 Phase 27 的完整实现生成。  
+Phase 1〜Phase 27 の実装に基づいて本ホワイトペーパーを生成しました。*
 
 ---
 

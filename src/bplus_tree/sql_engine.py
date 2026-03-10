@@ -726,7 +726,7 @@ def _execute_join(
     rows: list[list[Any]] = []
     for o_row in outer_tbl.scan_with_condition(lambda _: True, read_view=read_view):
         key_val = o_row.get_field(outer_key)
-        i_raw = inner_tbl._tree.search(key_val)
+        i_raw = inner_tbl._point_lookup(key_val)
         if i_raw is None:
             continue
         i_row = Tuple(inner_tbl._schema, raw=i_raw)

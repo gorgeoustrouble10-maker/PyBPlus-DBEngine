@@ -52,9 +52,9 @@ def _apply_wal_line(
             for op, k, v in pending.get(tx_id, []):
                 try:
                     if op == "INSERT" and v is not None:
-                        tbl._tree.insert(k, v)
+                        tbl.apply_insert(k, v)
                     elif op == "DELETE":
-                        tbl._tree.delete(k)
+                        tbl.apply_delete(k)
                 except Exception:
                     pass
         pending.pop(tx_id, None)
@@ -97,12 +97,12 @@ def _apply_wal_line(
         except Exception:
             pass
         try:
-            tbl._tree.insert(key, insert_val)
+            tbl.apply_insert(key, insert_val)
         except Exception:
             pass
     elif op == "DELETE":
         try:
-            tbl._tree.delete(key)
+            tbl.apply_delete(key)
         except Exception:
             pass
 

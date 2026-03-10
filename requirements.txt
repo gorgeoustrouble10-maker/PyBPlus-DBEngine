@@ -1,7 +1,8 @@
 # PyBPlus-DBEngine
-# Runtime: standard library only (no external deps for running the engine)
+# Runtime: sqlglot for AST parsing (Phase 26b+)
 # For development & testing:
 
+sqlglot>=24.0.0
 pytest>=8.0.0
 black>=24.0.0
 mypy>=1.8.0

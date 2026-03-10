@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
 from bplus_tree.schema import Schema
+from bplus_tree.storage_engine import BPlusTreeEngine
 from bplus_tree.table import RowTable, Tuple
 from bplus_tree.tree import BPlusTree
 
@@ -317,6 +318,8 @@ class PersistentTable:
             root_id = int(primary_data.get("root_id", -1))
             tree = _deserialize_tree_from_db(nodes, root_id, order)
             tbl._table._tree = tree
+            tbl._table._engine = BPlusTreeEngine(tree)
+            tbl._table.refresh_stats()
 
         for field, idx_data in payload.get("secondary_indexes", {}).items():
             nodes = idx_data.get("nodes", [])
@@ -342,7 +345,7 @@ class PersistentTable:
         idx_tree = BPlusTree(order=self._order)
         self._indexes[field_name] = idx_tree
         field_idx = self._schema.field_names().index(field_name)
-        for pk_key, raw in self._table._tree.range_scan(-(2**63), 2**63 - 1):
+        for pk_key, raw in self._table._engine.range_scan(-(2**63), 2**63 - 1):
             row = Tuple(self._schema, raw=raw)
             field_val = row._values[field_idx]
             idx_tree.insert((field_val, pk_key), 1)
@@ -359,7 +362,7 @@ class PersistentTable:
             )
         pk_val = tuple_data[self._pk_idx]
         row = Tuple(self._schema, values=tuple_data)
-        self._table._tree.insert(pk_val, row.to_bytes())
+        self._table.apply_insert(pk_val, row.to_bytes())
         for field_name, idx_tree in self._indexes.items():
             field_idx = self._schema.field_names().index(field_name)
             field_val = tuple_data[field_idx]
@@ -371,14 +374,14 @@ class PersistentTable:
         Chinese: 按主键删除行；同步更新二级索引。
         Japanese: 主キーで行を削除；セカンダリインデックスを同期更新。
         """
-        raw = self._table._tree.search(pk_value)
+        raw = self._table._point_lookup(pk_value)
         if raw is None:
             raise KeyError(f"Primary key {pk_value} not found")
         row = Tuple(self._schema, raw=raw)
         for field_name, idx_tree in self._indexes.items():
             field_val = row.get_field(field_name)
             idx_tree.delete((field_val, pk_value))
-        self._table._tree.delete(pk_value)
+        self._table._engine.delete(pk_value)
 
     def get_by_index(self, field_name: str, value: Any) -> Iterator[Tuple]:
         """
@@ -400,7 +403,7 @@ class PersistentTable:
             for (fv, pk_val), _ in idx_tree.range_scan(lo, hi):
                 if fv != value:
                     break
-                raw = self._table._tree.search(pk_val)
+                raw = self._table._point_lookup(pk_val)
                 if raw is not None:
                     yield Tuple(self._schema, raw=raw)
         else:
