@@ -86,7 +86,9 @@ class DBRequestHandler(socketserver.BaseRequestHandler):
                     continue
 
                 if db is not None:
-                    msg, rows, columns = execute_sql(sql, db=db, tx=self._tx)
+                    msg, rows, columns = execute_sql(
+                        sql, db=db, tx=self._tx, tx_manager=tx_manager
+                    )
                 else:
                     msg, rows, columns = execute_sql(sql, table=table, tx=self._tx)
                 payload = _encode_response_correct("OK", msg, rows, columns)

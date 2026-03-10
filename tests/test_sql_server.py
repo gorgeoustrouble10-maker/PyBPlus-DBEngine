@@ -4,6 +4,9 @@ Phase 15 测试：SQL 解析器、执行引擎、Wire Protocol。
 
 import sys
 from pathlib import Path
+
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from bplus_tree.schema import Schema
@@ -180,6 +183,85 @@ class TestPhase17:
             msg, _, _ = execute_sql("DROP TABLE z", db=ctx)
             assert "DROP TABLE ok" in msg
             assert "z" not in ctx._catalog.list_tables()
+
+
+class TestPhase18:
+    """Phase 18: ORDER BY, LIMIT, OFFSET, COUNT(*), SHOW TABLES, SHOW STATS, SQL security."""
+
+    def test_order_by_limit_offset(self) -> None:
+        schema = Schema(fields=[("id", "INT"), ("name", "VARCHAR(32)")])
+        table = RowTable(schema, primary_key="id")
+        for i in [3, 1, 4, 2]:
+            table.insert_row([i, f"x{i}"])
+        msg, rows, cols = execute_sql(
+            "SELECT id, name FROM t ORDER BY id ASC LIMIT 2 OFFSET 1",
+            table=table,
+        )
+        assert cols == ["id", "name"]
+        assert rows == [[2, "x2"], [3, "x3"]]
+
+        msg2, rows2, _ = execute_sql(
+            "SELECT * FROM t ORDER BY id DESC LIMIT 1",
+            table=table,
+        )
+        assert rows2 == [[4, "x4"]]
+
+    def test_count_star(self) -> None:
+        schema = Schema(fields=[("id", "INT"), ("x", "VARCHAR(8)")])
+        table = RowTable(schema, primary_key="id")
+        table.insert_row([1, "a"])
+        table.insert_row([2, "b"])
+        msg, rows, cols = execute_sql("SELECT COUNT(*) FROM t", table=table)
+        assert cols == ["COUNT(*)"]
+        assert rows == [[2]]
+
+    def test_show_tables(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from bplus_tree.database_context import DatabaseContext
+
+        with tempfile.TemporaryDirectory() as d:
+            ctx = DatabaseContext(Path(d))
+            execute_sql("CREATE TABLE a (id INT)", db=ctx)
+            execute_sql("CREATE TABLE b (id INT)", db=ctx)
+            msg, rows, cols = execute_sql("SHOW TABLES", db=ctx)
+            assert cols == ["Tables"]
+            assert len(rows) == 2
+            names = {r[0] for r in rows}
+            assert names == {"a", "b"}
+
+    def test_show_stats(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from bplus_tree.database_context import DatabaseContext
+        from bplus_tree.transaction import TransactionManager
+
+        with tempfile.TemporaryDirectory() as d:
+            ctx = DatabaseContext(Path(d))
+            execute_sql("CREATE TABLE x (id INT)", db=ctx)
+            tx_mgr = TransactionManager()
+            tx = tx_mgr.begin()
+            msg, rows, cols = execute_sql(
+                "SHOW STATS", db=ctx, tx_manager=tx_mgr
+            )
+            assert "buffer_pool_hit_rate" in [r[0] for r in rows]
+            assert "active_transactions" in [r[0] for r in rows]
+            active_row = next(r for r in rows if r[0] == "active_transactions")
+            assert active_row[1] == 1
+
+    def test_sql_syntax_error_no_crash(self) -> None:
+        from bplus_tree.sql_engine import parse_sql
+        from bplus_tree.errors import SQLSyntaxError
+
+        with pytest.raises(SQLSyntaxError) as ei:
+            parse_sql("SELECT ??? FROM")
+        assert ei.value.code == 1064
+
+    def test_varchar_limit(self) -> None:
+        from bplus_tree.errors import DataLimitError
+
+        with pytest.raises(DataLimitError):
+            parse_sql("CREATE TABLE t (id INT, x VARCHAR(99999))")
 
 
 class TestWireProtocol:

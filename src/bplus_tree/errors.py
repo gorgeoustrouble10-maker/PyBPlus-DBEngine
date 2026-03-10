@@ -96,3 +96,10 @@ class TableInUseError(DBError):
 
     def __init__(self, table: str) -> None:
         super().__init__(1091, f"Can't DROP table '{table}'; file in use")
+
+
+class DataLimitError(DBError):
+    """1118 - Row size too large / VARCHAR or INSERT data exceeds limit"""
+
+    def __init__(self, message: str = "Row size too large") -> None:
+        super().__init__(1118, message)

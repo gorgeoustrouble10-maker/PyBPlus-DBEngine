@@ -4,9 +4,9 @@
 
 ---
 
-**Version**: 1.5  
+**Version**: 1.6  
 **Date**: 2026  
-**Status**: Phase 1–Phase 17 (System Integrity Closure)
+**Status**: Phase 1–Phase 18 (Query Enhancement & Observability)
 
 ---
 
@@ -24,6 +24,7 @@
 10. [Phase 15: Wire Protocol & SQL Execution | Phase 15：Wire Protocol 与 SQL 执行流程](#10-phase-15-wire-protocol--sql-execution)
 11. [Phase 16: Recovery & DDL | Phase 16：恢复与数据定义语言](#11-phase-16-recovery--ddl)
 12. [Phase 17: System Integrity Closure | Phase 17：系统完整性合拢](#12-phase-17-system-integrity-closure)
+13. [Phase 18: Query Enhancement & Observability | Phase 18：查询优化与可观测性](#13-phase-18-query-enhancement--observability)
 
 ---
 
@@ -533,6 +534,34 @@ Client                    Server                     RowTable
 
 ---
 
+## 13. Phase 18: Query Enhancement & Observability
+## Phase 18：查询优化与可观测性
+## Phase 18：クエリ強化と観測可能性
+
+### 13.1 SQL Aggregation & Modifiers | 聚合与修饰 | 集約と修飾
+
+| 功能 | 语法 | 说明 |
+|------|------|------|
+| **ORDER BY** | `ORDER BY col [ASC\|DESC]` | 按列排序，默认 ASC |
+| **LIMIT** | `LIMIT n` | 返回最多 n 行 |
+| **OFFSET** | `OFFSET n` | 跳过前 n 行 |
+| **COUNT(*)** | `SELECT COUNT(*) FROM t` | 聚合返回行数 |
+
+### 13.2 Observability | 可观测性 | 観測可能性
+
+| 命令 | 输出 |
+|------|------|
+| **SHOW TABLES** | 表名列表（需 DatabaseContext） |
+| **SHOW STATS** | Buffer Pool 命中率、活跃事务数、各表文件字节数 |
+
+### 13.3 SQL Security | 安全防护 | セキュリティ
+
+- **异常捕获**：`parse_sql` 捕获所有非 `DBError` 异常，统一转换为 `SQLSyntaxError(1064)`，保证畸形 SQL 不会导致进程崩溃。
+- **VARCHAR 限制**：`CREATE TABLE` 中 `VARCHAR(N)` 的 N 不得超过 `MAX_VARCHAR_LENGTH`（默认 4096），超出则 `DataLimitError(1118)`。
+- **INSERT 限制**：单次 INSERT 数据估算字节数不得超过 `MAX_INSERT_BYTES`（默认 1MB），超出则 `DataLimitError(1118)`。
+
+---
+
 ## References
 ## 参考文献
 ## 参考文献
@@ -543,9 +572,9 @@ Client                    Server                     RowTable
 
 ---
 
-*Document generated from Phase 1–Phase 17 implementation.  
-本白皮书基于 Phase 1 至 Phase 17 的完整实现生成。  
-Phase 1〜Phase 17 の実装に基づいて本ホワイトペーパーを生成しました。*
+*Document generated from Phase 1–Phase 18 implementation.  
+本白皮书基于 Phase 1 至 Phase 18 的完整实现生成。  
+Phase 1〜Phase 18 の実装に基づいて本ホワイトペーパーを生成しました。*
 
 ---
 
