@@ -381,7 +381,7 @@ class PersistentTable:
         for field_name, idx_tree in self._indexes.items():
             field_val = row.get_field(field_name)
             idx_tree.delete((field_val, pk_value))
-        self._table._engine.delete(pk_value)
+        self._table.apply_delete(pk_value)
 
     def get_by_index(self, field_name: str, value: Any) -> Iterator[Tuple]:
         """
