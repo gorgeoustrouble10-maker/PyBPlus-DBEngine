@@ -57,6 +57,7 @@ class DBRequestHandler(socketserver.BaseRequestHandler):
         self._tx_manager = getattr(self.server, "tx_manager", None)
         self._table = getattr(self.server, "table", None)
         self._db = getattr(self.server, "db", None)
+        self._authenticated = getattr(self.server, "password", None) is None
         if hasattr(self.request, "settimeout"):
             self.request.settimeout(CLIENT_IDLE_TIMEOUT)
 
@@ -67,12 +68,25 @@ class DBRequestHandler(socketserver.BaseRequestHandler):
             self._send_error("[1049] No database or table configured")
             return
         tx_manager = self._tx_manager
+        password = getattr(self.server, "password", None)
         while True:
             try:
                 raw = self._read_message()
                 if raw is None:
                     break
                 sql = raw.decode("utf-8").strip()
+                if not self._authenticated and password is not None:
+                    if sql.upper().startswith("AUTH "):
+                        if sql[5:].strip() == password:
+                            self._authenticated = True
+                            self._send_ok("Authenticated")
+                        else:
+                            self._send_error("[1045] Access denied")
+                            break
+                    else:
+                        self._send_error("[1045] Authentication required; send AUTH <password> first")
+                        break
+                    continue
                 if not sql:
                     continue
                 if sql.upper() in ("QUIT", "EXIT", "BYE"):
@@ -181,14 +195,15 @@ class DBRequestHandler(socketserver.BaseRequestHandler):
 
 class DBServer(socketserver.ThreadingTCPServer):
     """
-    English: TCP server with table/db and tx_manager attributes.
-    Chinese: 带 table/db 与 tx_manager 属性的 TCP 服务器。
-    Japanese: table/db と tx_manager 属性を持つ TCP サーバー。
+    English: TCP server with table/db, tx_manager, password attributes.
+    Chinese: 带 table/db、tx_manager、password 属性的 TCP 服务器。
+    Japanese: table/db、tx_manager、password 属性を持つ TCP サーバー。
     """
 
     table: Optional[RowTable] = None
     tx_manager: Optional[Any] = None
     db: Optional[Any] = None
+    password: Optional[str] = None
 
 
 def run_server(
@@ -196,6 +211,7 @@ def run_server(
     db: Optional[Any] = None,
     host: str = "127.0.0.1",
     port: int = 8765,
+    password: Optional[str] = None,
 ) -> None:
     """
     English: Start multi-threaded TCP server; use db (with recovery) or table.
@@ -208,6 +224,7 @@ def run_server(
         server.table = table
         server.db = db
         server.tx_manager = TransactionManager()
+        server.password = password
         server.daemon_threads = True
         server.allow_reuse_address = True
         print(f"PyBPlus-DB Server on {host}:{port}")
@@ -218,6 +235,7 @@ def run_server_with_recovery(
     data_dir: str | Path,
     host: str = "127.0.0.1",
     port: int = 8765,
+    password: str | None = None,
 ) -> None:
     """
     English: Start server with Catalog + WAL recovery; CREATE TABLE supported.
@@ -229,4 +247,4 @@ def run_server_with_recovery(
     ctx = DatabaseContext(Path(data_dir) if not isinstance(data_dir, Path) else data_dir)
     ctx.load_tables()
     ctx.run_recovery()
-    run_server(db=ctx, host=host, port=port)
+    run_server(db=ctx, host=host, port=port, password=password)

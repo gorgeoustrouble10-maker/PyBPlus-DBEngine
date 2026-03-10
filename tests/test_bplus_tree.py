@@ -232,7 +232,8 @@ class TestBPlusTree:
             tree.save_to_db(path)
             loaded = BPlusTree.load_from_db(path)
             for i in range(1, 11):
-                assert loaded.search(i) == f"v{i}"
+                got = loaded.search(i)
+                assert got in (f"v{i}", f"v{i}".encode("utf-8")), f"expected v{i} or bytes, got {got!r}"
             keys = list(loaded.iterate_leaf_keys())
             assert keys == list(range(1, 11))
         finally:

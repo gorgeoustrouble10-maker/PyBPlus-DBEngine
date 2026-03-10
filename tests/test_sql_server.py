@@ -301,6 +301,32 @@ class TestPhase19Savepoints:
         assert hasattr(rb, "name") and rb.name == "my_sp"
 
 
+class TestBufferPoolPersistence:
+    """Phase 21: 统一持久化 - BufferPool 持久化验证。"""
+
+    def test_buffer_pool_persistence(self) -> None:
+        """create_table -> insert -> checkpoint -> 新上下文 load -> 数据可查。"""
+        import tempfile
+        from pathlib import Path
+        from bplus_tree.database_context import DatabaseContext
+        from bplus_tree.sql_engine import execute_sql
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            ctx = DatabaseContext(path)
+            execute_sql("CREATE TABLE bp (id INT, v VARCHAR(16))", db=ctx)
+            execute_sql("INSERT INTO bp (id, v) VALUES (1, 'a')", db=ctx)
+            execute_sql("INSERT INTO bp (id, v) VALUES (2, 'b')", db=ctx)
+            ctx.checkpoint_all()
+
+            ctx2 = DatabaseContext(path)
+            ctx2.load_tables()
+            msg, rows, cols = execute_sql("SELECT * FROM bp", db=ctx2)
+            assert len(rows) == 2
+            ids = sorted(r[0] for r in rows)
+            assert ids == [1, 2]
+
+
 class TestWireProtocol:
     """Wire Protocol 编码测试。"""
 

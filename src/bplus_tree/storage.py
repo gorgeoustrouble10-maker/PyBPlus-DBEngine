@@ -273,8 +273,8 @@ def _deserialize_leaf_slotted(raw: bytes) -> LeafNode:
     next_id = struct.unpack_from("<i", raw, 11)[0]
     slot_array_end = struct.unpack_from("<H", raw, 15)[0]
 
-    keys: list[int] = []
-    values: list[str] = []
+    keys_list: list[int] = []
+    values_list: list[bytes] = []
     INVALID_OFF: int = 0xFFFF
     for i in range(key_count):
         so = LEAF_SLOTTED_HEADER_SIZE + i * SLOTTED_SLOT_SIZE
@@ -290,11 +290,11 @@ def _deserialize_leaf_slotted(raw: bytes) -> LeafNode:
         if vlen > rec_len - 10:
             continue
         vb = raw[rec_off + 10 : rec_off + 10 + vlen]
-        keys.append(k)
-        values.append(vb.decode("utf-8"))
+        keys_list.append(k)
+        values_list.append(vb)
     node = LeafNode()
-    node.keys = keys
-    node.values = values
+    node.keys = keys_list
+    node.values = values_list
     node.prev_id = prev_id
     node.next_id = next_id
     return node
@@ -333,7 +333,7 @@ def deserialize_page(raw: bytes, page_id: int) -> InternalNode | LeafNode:
         for _ in range(key_count):
             vlen = struct.unpack_from("<H", raw, off)[0]
             off += 2
-            values.append(raw[off : off + vlen].decode("utf-8"))
+            values.append(raw[off : off + vlen])
             off += vlen
         node = LeafNode()
         node.keys = keys
@@ -496,7 +496,7 @@ class BufferPool:
             next_id = node.next_id if node.next_id >= 0 else INVALID_PAGE_ID
             raw = serialize_leaf_page_slotted(
                 [_ensure_int_key(k) for k in node.keys],
-                [_ensure_str_value(v) for v in node.values],
+                [v if isinstance(v, bytes) else str(v).encode("utf-8") for v in node.values],
                 prev_id,
                 next_id,
             )

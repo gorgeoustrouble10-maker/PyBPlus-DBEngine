@@ -22,6 +22,7 @@ from bplus_tree.errors import (
 )
 from bplus_tree.schema import Schema
 from bplus_tree.table import RowTable, Tuple
+from bplus_tree.transaction import create_read_view
 
 # Security limits: VARCHAR max length, single INSERT payload size (bytes)
 MAX_VARCHAR_LENGTH: int = 4096
@@ -82,6 +83,11 @@ class ParsedShowStats:
 
 
 @dataclass
+class ParsedShowHealth:
+    """Parsed SHOW HEALTH statement."""
+
+
+@dataclass
 class ParsedInsert:
     """
     English: Parsed INSERT statement.
@@ -129,7 +135,7 @@ class ParsedRollbackTo:
 
 def parse_sql(
     sql: str,
-) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats:
+) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSavepoint | ParsedRollbackTo:
     """
     English: Parse SQL string; malformed SQL returns 1064 Syntax Error, never crashes.
     Chinese: 解析 SQL；畸形 SQL 返回 1064 语法错误，不会导致进程崩溃。
@@ -143,7 +149,9 @@ def parse_sql(
         raise SQLSyntaxError("SQL syntax error")
 
 
-def _parse_sql_impl(sql: str):
+def _parse_sql_impl(
+    sql: str,
+) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSavepoint | ParsedRollbackTo:
     """Internal parse; exceptions converted by parse_sql."""
     sql = sql.strip().rstrip(";").strip()
     if not sql:
@@ -158,6 +166,8 @@ def _parse_sql_impl(sql: str):
         return ParsedShowTables()
     if upper.startswith("SHOW STATS"):
         return ParsedShowStats()
+    if upper.startswith("SHOW HEALTH"):
+        return ParsedShowHealth()
     if upper.startswith("SELECT"):
         return _parse_select(sql)
     if upper.startswith("INSERT"):
@@ -242,7 +252,7 @@ def _parse_select(sql: str) -> ParsedSelect:
     limit: Optional[int] = None
     offset: Optional[int] = None
 
-    def strip_trailing(pat: str):
+    def strip_trailing(pat: str) -> Optional[re.Match[str]]:
         nonlocal rest
         m = re.search(pat, rest, re.IGNORECASE)
         if m:
@@ -530,6 +540,9 @@ def execute_sql(
     if isinstance(parsed, ParsedShowStats):
         return _execute_show_stats(db, tx_manager)
 
+    if isinstance(parsed, ParsedShowHealth):
+        return ("OK", [["status", "OK"]], ["metric", "value"])
+
     if isinstance(parsed, ParsedSelect):
         tbl = _get_table(parsed.table)
         columns = parsed.columns
@@ -540,32 +553,35 @@ def execute_sql(
                 if c not in names:
                     raise UnknownColumnError(c)
             names = columns
-        rows: list[list[Any]] = []
+        read_view = None
+        if tx is not None and tx_manager is not None:
+            read_view = create_read_view(tx_manager, tx.tx_id)
+        select_rows: list[list[Any]] = []
         for r in tbl.scan_with_condition(
             lambda _: True,
             start_key=parsed.start_key,
             end_key=parsed.end_key,
-            read_view=None,
+            read_view=read_view,
         ):
-            rows.append([r.get_field(n) for n in names])
+            select_rows.append([r.get_field(n) for n in names])
 
         if parsed.is_count:
-            rows = [[len(rows)]]
+            select_rows = [[len(select_rows)]]
             names = ["COUNT(*)"]
-            return ("(1 row)", rows, names)
+            return ("(1 row)", select_rows, names)
 
         if parsed.order_by_col:
             if parsed.order_by_col not in names:
                 raise UnknownColumnError(parsed.order_by_col)
             col_idx = names.index(parsed.order_by_col)
-            rows.sort(key=lambda r: r[col_idx], reverse=parsed.order_desc)
+            select_rows.sort(key=lambda r: r[col_idx], reverse=parsed.order_desc)
 
         if parsed.offset is not None:
-            rows = rows[parsed.offset:]
+            select_rows = select_rows[parsed.offset:]
         if parsed.limit is not None:
-            rows = rows[: parsed.limit]
+            select_rows = select_rows[: parsed.limit]
 
-        return (f"({len(rows)} rows)", rows, names)
+        return (f"({len(select_rows)} rows)", select_rows, names)
 
     if isinstance(parsed, ParsedInsert):
         tbl = _get_table(parsed.table)

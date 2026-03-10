@@ -23,14 +23,15 @@ def main() -> None:
     parser.add_argument("-H", "--host", default="127.0.0.1", help="Bind host")
     parser.add_argument("-P", "--port", type=int, default=8765, help="Bind port")
     parser.add_argument("-d", "--data-dir", default=None, help="Data directory; enables catalog + WAL recovery")
+    parser.add_argument("--password", default=None, help="Require AUTH <password> as first message")
     args = parser.parse_args()
 
     if args.data_dir:
-        run_server_with_recovery(args.data_dir, host=args.host, port=args.port)
+        run_server_with_recovery(args.data_dir, host=args.host, port=args.port, password=args.password)
     else:
         schema = Schema(fields=[("id", "INT"), ("name", "VARCHAR(32)"), ("score", "FLOAT")])
         table = RowTable(schema, primary_key="id")
-        run_server(table=table, host=args.host, port=args.port)
+        run_server(table=table, host=args.host, port=args.port, password=args.password)
 
 
 if __name__ == "__main__":

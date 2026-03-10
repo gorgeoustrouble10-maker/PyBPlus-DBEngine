@@ -393,6 +393,9 @@ class BPlusTree:
         rid = pool.get_root_page_id()
         tree = cls()
         if rid < 0:
+            pool._save_header()
+            tree._pool = pool
+            tree._node_to_pid = {}
             return tree
         root, pid_to_node = _reconstruct_tree_from_pool(rid, pool)
         tree._root = root
