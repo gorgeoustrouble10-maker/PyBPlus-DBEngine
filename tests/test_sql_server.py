@@ -418,6 +418,162 @@ class TestBufferPoolPersistence:
             assert ids == [1, 2]
 
 
+class TestSemiSyncConsistency:
+    """Phase 26a: 半同步复制 - Slave ACK、Master 等待、超时降级。"""
+
+    def test_semi_sync_consistency(self) -> None:
+        """Semi-sync 模式：Master 等待 Slave ACK 后才返回；Slave 无连接时超时降级。"""
+        import shutil
+        import tempfile
+        import time
+        from pathlib import Path
+
+        from bplus_tree.database_context import DatabaseContext
+        from bplus_tree.replication import ReplicationPublisher, ReplicationSubscriber
+
+        d = tempfile.mkdtemp()
+        publisher = None
+        subscriber = None
+        try:
+            path = Path(d)
+            ctx = DatabaseContext(path)
+            ctx.create_table("t", Schema(fields=[("id", "INT"), ("v", "VARCHAR(8)")]), "id")
+
+            repl_port = 18770
+            replication_info: dict[str, Any] = {
+                "node_role": "MASTER",
+                "replication_type": "SEMI_SYNC",
+            }
+            publisher = ReplicationPublisher(ctx._data_dir, ctx.get_tables(), repl_port)
+            publisher.start()
+
+            from bplus_tree.sql_engine import execute_sql
+
+            # 无 Slave：INSERT 应超时并降级为 ASYNC
+            execute_sql(
+                "INSERT INTO t (id, v) VALUES (1, 'a')",
+                db=ctx,
+                replication_info=replication_info,
+                replication_publisher=publisher,
+                replication_timeout=0.05,
+            )
+            assert replication_info.get("replication_type") == "ASYNC"
+
+            # 重置为 SEMI_SYNC 并启动 Slave
+            replication_info["replication_type"] = "SEMI_SYNC"
+            tables = ctx.get_tables()
+            subscriber = ReplicationSubscriber(
+                "127.0.0.1",
+                repl_port,
+                tables,
+                replication_info_ref={"node_role": "SLAVE"},
+                failover_timeout_sec=10.0,
+            )
+            subscriber.start()
+            time.sleep(0.3)
+
+            # 有 Slave：INSERT 应成功，Slave 收到并 ACK
+            execute_sql(
+                "INSERT INTO t (id, v) VALUES (2, 'b')",
+                db=ctx,
+                replication_info=replication_info,
+                replication_publisher=publisher,
+                replication_timeout=0.2,
+            )
+            assert replication_info.get("replication_type") == "SEMI_SYNC"
+
+            time.sleep(0.2)
+            slave_t = tables["t"]
+            rows = list(slave_t.scan_with_condition(lambda _: True))
+            ids = sorted(r.get_field("id") for r in rows)
+            assert 2 in ids
+        finally:
+            if subscriber:
+                subscriber.stop()
+            if publisher:
+                publisher.stop()
+            time.sleep(0.2)
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestPhase26bJoin:
+    """Phase 26b: Nested Loop Join、EXPLAIN JOIN、AST 解析。"""
+
+    def test_join_nested_loop(self) -> None:
+        """SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id"""
+        import tempfile
+        from pathlib import Path
+
+        from bplus_tree.database_context import DatabaseContext
+        from bplus_tree.sql_engine import execute_sql, parse_sql
+
+        with tempfile.TemporaryDirectory() as d:
+            ctx = DatabaseContext(Path(d))
+            execute_sql("CREATE TABLE t1 (id INT, a VARCHAR(8))", db=ctx)
+            execute_sql("CREATE TABLE t2 (id INT, b VARCHAR(8))", db=ctx)
+            execute_sql("INSERT INTO t1 (id, a) VALUES (1, 'x')", db=ctx)
+            execute_sql("INSERT INTO t1 (id, a) VALUES (2, 'y')", db=ctx)
+            execute_sql("INSERT INTO t2 (id, b) VALUES (1, 'p')", db=ctx)
+            execute_sql("INSERT INTO t2 (id, b) VALUES (2, 'q')", db=ctx)
+
+            msg, rows, cols = execute_sql(
+                "SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id",
+                db=ctx,
+            )
+            assert len(rows) == 2
+            by_a = {r[0]: r[1] for r in rows}
+            assert by_a.get("x") == "p"
+            assert by_a.get("y") == "q"
+
+    def test_explain_join(self) -> None:
+        """EXPLAIN SELECT ... JOIN 展示执行顺序与代价"""
+        import tempfile
+        from pathlib import Path
+
+        from bplus_tree.database_context import DatabaseContext
+        from bplus_tree.sql_engine import execute_sql
+
+        with tempfile.TemporaryDirectory() as d:
+            ctx = DatabaseContext(Path(d))
+            execute_sql("CREATE TABLE t1 (id INT, a INT)", db=ctx)
+            execute_sql("CREATE TABLE t2 (id INT, b INT)", db=ctx)
+            execute_sql("INSERT INTO t1 (id, a) VALUES (1, 10)", db=ctx)
+            execute_sql("INSERT INTO t2 (id, b) VALUES (1, 20)", db=ctx)
+
+            msg, rows, cols = execute_sql(
+                "EXPLAIN SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id",
+                db=ctx,
+            )
+            by_item = {r[0]: r[1] for r in rows}
+            assert "SELECT (JOIN)" in str(by_item.get("Query Type", ""))
+            assert "NESTED_LOOP_JOIN" in str(by_item.get("Join Type", ""))
+            assert "Join Condition" in by_item
+
+
+class TestSetGlobal:
+    """Phase 26a: SET GLOBAL replication_type。"""
+
+    def test_set_global_replication_type(self) -> None:
+        from bplus_tree.sql_engine import parse_sql, execute_sql
+
+        p = parse_sql("SET GLOBAL replication_type = 'SEMI_SYNC'")
+        assert p.var == "replication_type"
+        assert p.value == "SEMI_SYNC"
+
+        repl_info: dict[str, Any] = {"replication_type": "ASYNC"}
+        msg, _, _ = execute_sql(
+            "SET GLOBAL replication_type = 'SEMI_SYNC'",
+            replication_info=repl_info,
+        )
+        assert repl_info["replication_type"] == "SEMI_SYNC"
+
+        msg, _, _ = execute_sql(
+            "SET GLOBAL replication_type = 'ASYNC'",
+            replication_info=repl_info,
+        )
+        assert repl_info["replication_type"] == "ASYNC"
+
+
 class TestWireProtocol:
     """Wire Protocol 编码测试。"""
 

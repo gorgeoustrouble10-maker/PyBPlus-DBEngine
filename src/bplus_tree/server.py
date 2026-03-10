@@ -141,15 +141,21 @@ class DBRequestHandler(socketserver.BaseRequestHandler):
                     continue
 
                 repl_info = getattr(self.server, "replication_info", None)
+                repl_pub = getattr(self.server, "replication_publisher", None)
+                repl_to = getattr(self.server, "replication_timeout", 0.1)
                 if db is not None:
                     msg, rows, columns = execute_sql(
                         sql, db=db, tx=self._tx, tx_manager=tx_manager,
                         replication_info=repl_info,
+                        replication_publisher=repl_pub,
+                        replication_timeout=repl_to,
                     )
                 else:
                     msg, rows, columns = execute_sql(
                         sql, table=table, tx=self._tx,
                         replication_info=repl_info,
+                        replication_publisher=repl_pub,
+                        replication_timeout=repl_to,
                     )
                 payload = _encode_response_correct("OK", msg, rows, columns)
                 self._send_raw(payload)
@@ -211,6 +217,8 @@ class DBServer(socketserver.ThreadingTCPServer):
     db: Optional[Any] = None
     password: Optional[str] = None
     replication_info: Optional[dict[str, Any]] = None
+    replication_publisher: Optional[Any] = None
+    replication_timeout: float = 0.1
 
 
 def run_server(
@@ -220,6 +228,8 @@ def run_server(
     port: int = 8765,
     password: Optional[str] = None,
     replication_info: Optional[dict[str, Any]] = None,
+    replication_publisher: Optional[Any] = None,
+    replication_timeout: float = 0.1,
 ) -> None:
     """
     English: Start multi-threaded TCP server; use db (with recovery) or table.
@@ -235,6 +245,8 @@ def run_server(
         server.tx_manager = TransactionManager()
         server.password = password
         server.replication_info = replication_info
+        server.replication_publisher = replication_publisher
+        server.replication_timeout = replication_timeout
         server.daemon_threads = True
         server.allow_reuse_address = True
         logging.info("PyBPlus-DB Server on %s:%d", host, port)
@@ -261,7 +273,7 @@ def run_server_with_recovery(
     ctx.load_tables()
     ctx.run_recovery()
 
-    replication_info: dict[str, Any] = {}
+    replication_info: dict[str, Any] = {"replication_type": "ASYNC"}
     publisher: Any = None
     subscriber: Any = None
 
@@ -282,4 +294,12 @@ def run_server_with_recovery(
         publisher = ReplicationPublisher(ctx._data_dir, ctx.get_tables(), replication_port)
         publisher.start()
 
-    run_server(db=ctx, host=host, port=port, password=password, replication_info=replication_info)
+    run_server(
+        db=ctx,
+        host=host,
+        port=port,
+        password=password,
+        replication_info=replication_info,
+        replication_publisher=publisher,
+        replication_timeout=0.1,
+    )

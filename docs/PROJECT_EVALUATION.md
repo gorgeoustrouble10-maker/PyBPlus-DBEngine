@@ -4,6 +4,13 @@
 
 ---
 
+> **📌 历史阶段文档 | Historical Document | 歴史的ドキュメント**  
+> 本文档定格于 Phase 15 的评估结论，供追溯项目演进。当前项目已推进至 **Phase 27**。  
+> **Phase 16–27 一句话摘要**：16 恢复与 DDL | 17 系统完整性 | 18 聚合与可观测性 | 19 并发与保存点 | 21–22 统一持久化与 MVCC | 24 执行计划与主从复制 | 25 代价模型与自动故障转移 | 26a 半同步复制 | 26b AST 解析与 Nested Loop Join | 27 存储抽象与布隆过滤器。  
+> 最新架构详见 [Architecture Whitepaper](PyBPlus-DBEngine_Architecture_WhitePaper.md) (Phase 1–27)。
+
+---
+
 ## 一、执行摘要 | Executive Summary | エグゼクティブサマリー
 
 PyBPlus-DBEngine 已完成 **Phase 1–Phase 15**，从裸 B+ 树演进至具备 SQL 接口与多线程网络服务器的可运行数据库原型。**架构分层清晰，存储引擎逻辑闭环已打通，网络层与 SQL 层已联通**。

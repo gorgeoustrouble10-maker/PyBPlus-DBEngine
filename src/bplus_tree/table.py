@@ -10,7 +10,9 @@ import struct
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Optional
 
+from bplus_tree.bloom_filter import BloomFilter
 from bplus_tree.schema import Schema
+from bplus_tree.storage_engine import BPlusTreeEngine, StorageEngine
 from bplus_tree.tree import BPlusTree
 
 
@@ -134,11 +136,12 @@ class RowTable:
         tree: Optional[BPlusTree] = None,
         order: int = 16,
         tx_manager: Optional[Any] = None,
+        engine: Optional[StorageEngine] = None,
+        enable_bloom_filter: bool = True,
     ) -> None:
         """
         English: Create table with schema and primary key field.
         Chinese: 用模式与主键字段创建表。
-        Japanese: スキーマと主キーでテーブルを作成します。
 
         Args:
             schema: Row schema.
@@ -146,17 +149,28 @@ class RowTable:
             tree: Optional existing BPlusTree; if None, creates new one.
             order: B+ tree order when creating new tree.
             tx_manager: Optional TransactionManager for MVCC.
+            engine: Optional StorageEngine; if None, wraps tree in BPlusTreeEngine.
+            enable_bloom_filter: If True, use Bloom filter to skip IO for absent keys.
         """
         self._schema = schema
         self._pk = primary_key
         if primary_key not in schema.field_names():
             raise ValueError(f"Primary key '{primary_key}' not in schema")
         self._pk_idx = schema.field_names().index(primary_key)
-        self._tree = tree if tree is not None else BPlusTree(order=order)
+        if engine is not None:
+            self._engine = engine
+            self._tree = getattr(engine, "tree", engine)
+        else:
+            bt = tree if tree is not None else BPlusTree(order=order)
+            self._engine = BPlusTreeEngine(bt)
+            self._tree = bt
         self._tx_manager = tx_manager
         self._total_rows: int = 0
         self._index_unique_counts: dict[str, int] = {}
         self._stats = TableStats()
+        self._bloom_filter: Optional[BloomFilter] = (
+            BloomFilter(num_bits=16384, num_hashes=4) if enable_bloom_filter else None
+        )
 
     def insert_row(
         self,
@@ -180,7 +194,9 @@ class RowTable:
         if transaction is not None:
             transaction.register_table(self)
             transaction.log_insert_undo(key, raw, table=self)
-        self._tree.insert(key, raw)
+        self._engine.insert(key, raw)
+        if self._bloom_filter is not None:
+            self._bloom_filter.add(key)
         self._total_rows += 1
         self._stats.total_rows = self._total_rows
         self._stats.index_cardinality = self._total_rows
@@ -195,13 +211,13 @@ class RowTable:
         Chinese: 按主键删除行；可选传入事务以记录 Undo。
         Japanese: 主キーで行を削除；オプションでトランザクションを渡し Undo を記録。
         """
-        raw = self._tree.search(key)
+        raw = self._point_lookup(key)
         if raw is None:
             raise KeyError(f"Primary key {key} not found")
         if transaction is not None:
             transaction.register_table(self)
             transaction.log_delete_undo(key, raw, table=self)
-        self._tree.delete(key)
+        self._engine.delete(key)
         self._total_rows = max(0, self._total_rows - 1)
         self._stats.total_rows = self._total_rows
         self._stats.index_cardinality = self._total_rows
@@ -245,15 +261,42 @@ class RowTable:
             return "TABLE_SCAN"
         return "INDEX_SCAN"
 
+    def _point_lookup(self, key: Any) -> Optional[Any]:
+        """
+        Point lookup with Bloom filter; skip engine search if filter says absent.
+        """
+        if self._bloom_filter is not None and not self._bloom_filter.may_contain(key):
+            return None
+        return self._engine.search(key)
+
+    def apply_insert(self, key: Any, value: Any) -> None:
+        """Insert key-value (for WAL replay/replication); updates Bloom filter."""
+        self._engine.insert(key, value)
+        if self._bloom_filter is not None:
+            self._bloom_filter.add(key)
+        self._total_rows += 1
+        self._stats.total_rows = self._total_rows
+        self._stats.index_cardinality = self._total_rows
+
+    def apply_delete(self, key: Any) -> None:
+        """Delete by key (for WAL replay/replication)."""
+        self._engine.delete(key)
+        self._total_rows = max(0, self._total_rows - 1)
+        self._stats.total_rows = self._total_rows
+        self._stats.index_cardinality = self._total_rows
+
     def refresh_stats(self) -> None:
         """
         English: Recompute total_rows and index_cardinality from range scan (e.g. after load).
         Chinese: 从范围扫描重新计算 total_rows 与 index_cardinality（如加载后）。
-        Japanese: 範囲スキャンから total_rows と index_cardinality を再計算（ロード後など）。
         """
-        self._total_rows = sum(
-            1 for _ in self._tree.range_scan(-(2**63), 2**63 - 1)
-        )
+        self._total_rows = 0
+        if self._bloom_filter is not None:
+            self._bloom_filter = BloomFilter(num_bits=16384, num_hashes=4)
+        for k, _ in self._engine.range_scan(-(2**63), 2**63 - 1):
+            self._total_rows += 1
+            if self._bloom_filter is not None:
+                self._bloom_filter.add(k)
         self._stats.total_rows = self._total_rows
         self._stats.index_cardinality = self._total_rows
 
@@ -276,7 +319,7 @@ class RowTable:
         """
         if in_values is not None and in_values:
             for k in in_values:
-                raw = self._tree.search(k)
+                raw = self._point_lookup(k)
                 if raw is None:
                     continue
                 row = Tuple(self._schema, raw=raw)
@@ -305,7 +348,7 @@ class RowTable:
                 return False
             return bool(condition(r))
 
-        for _key, raw in self._tree.range_scan(scan_lo, scan_hi):
+        for _key, raw in self._engine.range_scan(scan_lo, scan_hi):
             row = Tuple(self._schema, raw=raw)
             if read_view is not None and not read_view.is_visible(row.tx_id):
                 continue

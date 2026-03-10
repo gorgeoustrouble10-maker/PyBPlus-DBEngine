@@ -34,9 +34,9 @@ def run_recovery(data_dir: Path, tables: dict[str, RowTable]) -> None:
             for op, key, value in WriteAheadLog.replay(per_wal):
                 try:
                     if op == "INSERT" and value is not None:
-                        table._tree.insert(key, value)
+                        table.apply_insert(key, value)
                     elif op == "DELETE":
-                        table._tree.delete(key)
+                        table.apply_delete(key)
                 except (KeyError, Exception):
                     pass
     if not has_per_table and tables:
@@ -46,9 +46,9 @@ def run_recovery(data_dir: Path, tables: dict[str, RowTable]) -> None:
             for op, key, value in WriteAheadLog.replay(global_wal):
                 try:
                     if op == "INSERT" and value is not None:
-                        target._tree.insert(key, value)
+                        target.apply_insert(key, value)
                     elif op == "DELETE":
-                        target._tree.delete(key)
+                        target.apply_delete(key)
                 except (KeyError, Exception):
                     pass
 

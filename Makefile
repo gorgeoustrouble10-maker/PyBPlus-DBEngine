@@ -16,7 +16,7 @@ install:
 run:
 	python scripts/run_server.py -d ./data -H 127.0.0.1 -P 8765
 
-# Run 76+ core tests
+# Run 84+ core tests
 test:
 	pytest tests/ -v
 

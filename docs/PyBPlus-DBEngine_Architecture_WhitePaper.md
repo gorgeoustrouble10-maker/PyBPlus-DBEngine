@@ -4,9 +4,9 @@
 
 ---
 
-**Version**: 2.1  
+**Version**: 2.4  
 **Date**: 2026  
-**Status**: Phase 1–Phase 25 (Cost Estimation, Auto-Failover)
+**Status**: Phase 1–Phase 27 (Storage Abstraction, Bloom Filter Optimization)
 
 ---
 
@@ -29,6 +29,9 @@
 15. [Phase 21-22: Unified Persistence & Full MVCC | Phase 21-22：统一持久化与完整 MVCC](#15-phase-21-22-unified-persistence--full-mvcc)
 16. [Phase 24: Query Profiling & WAL Replication | Phase 24：执行计划分析与主从同步](#16-phase-24-query-profiling--wal-replication)
 17. [Phase 25: Cost Estimation & Auto-Failover | Phase 25：代价模型与自动故障转移](#17-phase-25-cost-estimation--auto-failover)
+18. [Phase 26a: Semi-Sync Replication | Phase 26a：半同步复制与一致性增强](#18-phase-26a-semi-sync-replication)
+19. [Phase 26b: AST Parser & Nested Loop Join | Phase 26b：AST 解析与嵌套循环关联](#19-phase-26b-ast-parser--nested-loop-join)
+20. [Phase 27: Storage Abstraction & Bloom Filter | Phase 27：存储抽象与布隆过滤器](#20-phase-27-storage-abstraction--bloom-filter)
 
 ---
 
@@ -685,7 +688,7 @@ flowchart TB
 | **Master** | `--replication-port 8767` | 在端口 8767 接受 Slave 连接，推送 WAL 流 |
 | **Slave** | `--slave-of 127.0.0.1:8767` | 连接 Master，接收 WAL 并实时重放 |
 
-**数据流**：Master 的 WAL 尾读线程定期轮询 `wal_*.log`，将新增记录以 `table\tline` 格式推送给已连接的 Slave。Slave 解析并调用 `_apply_wal_line` 重放。
+**数据流**：Master 的 WAL 尾读线程定期轮询 `wal_*.log`，将新增记录以 `table\toffset\tline` 格式（Phase 26a：offset 为字节偏移）推送给已连接的 Slave。Slave 解析、重放后回发 `ACK\t{table}\t{offset}`；半同步模式下 Master 等待 ACK 后再向客户端返回成功。
 
 ### 16.3 运维指标增强 | Operations Metrics | オペレーションメトリクス
 
@@ -739,19 +742,245 @@ Cost_IndexScan = estimated_range_rows × 0.5 + 10   (10 为索引寻道常数)
 
 ---
 
+## 18. Phase 26a: Semi-Sync Replication
+## Phase 26a：半同步复制与写一致性增强
+## Phase 26a：セミ同期レプリケーションと書き込み一貫性強化
+
+### 18.1 半同步协议时序图 | Semi-Sync Protocol Sequence Diagram
+### 半同期プロトコルシーケンス図
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Master
+    participant WAL
+    participant Publisher
+    participant Slave
+
+    Client->>Master: INSERT
+    Master->>WAL: log_insert
+    Master->>Publisher: tail & broadcast(table, offset, line)
+    Publisher->>Slave: table\toffset\tline
+
+    Slave->>Slave: _apply_wal_line
+    Slave->>Publisher: ACK\ttable\toffset
+
+    Publisher->>Publisher: last_acked[table] = max(..., offset)
+    Publisher->>Publisher: condition.notify_all
+
+    Master->>Master: wait_for_ack(table, offset, timeout)
+    alt ACK received
+        Master->>Client: INSERT ok
+    else Timeout
+        Master->>Master: degrade to ASYNC, log warning
+        Master->>Client: INSERT ok
+    end
+```
+
+**说明**：Master 在返回客户端成功前，若启用半同步模式，则需在 Condition Variable 上阻塞，直至收到至少一个 Slave 对当前 WAL 偏移量的 ACK；超时（默认 100ms）则自动降级为异步并记录告警。
+
+### 18.2 Slave ACK 机制 | Slave ACK Mechanism | スレーブ ACK メカニズム
+
+| 组件 | 行为 |
+|------|------|
+| **ReplicationSubscriber** | 成功重放一条 WAL 后，立即向 Master 发送 `ACK\t{table}\t{offset}\n` |
+| **消息格式** | 从 `table\tline` 升级为 `table\toffset\tline`，offset 为 WAL 文件字节位置 |
+| **ReplicationPublisher** | 独立 `_ack_receiver` 线程，使用 `select` 从 Slave 连接读取 ACK，更新 `last_acked[table]` |
+
+### 18.3 Master 等待逻辑 | Master WAIT_FOR_SLAVE Logic | マスター待機ロジック
+
+| 配置 | 值 | 说明 |
+|------|-----|------|
+| **replication_timeout** | 100ms（默认） | 等待 ACK 超时时间 |
+| **超时处理** | 自动降级 | 超时后设置 `replication_type = 'ASYNC'`，记录 `logging.warning` |
+| **调用点** | `execute_sql` INSERT 分支 | 在 `tbl.insert_row` 成功后，若 `replication_type == 'SEMI_SYNC'` 则调用 `wait_for_ack` |
+
+### 18.4 一致性折中方案 | Consistency Trade-off | 一貫性トレードオフ
+
+| 模式 | 延迟 | 一致性 | 适用场景 |
+|------|------|--------|----------|
+| **ASYNC** | 低 | 最终一致 | 高吞吐、可容忍短暂主从落后 |
+| **SEMI_SYNC** | 中等（+ 网络 RTT） | 至少一从已持久 | 强一致读从库、故障切换零丢失 |
+
+**折中要点**：
+- 半同步保证：客户端收到成功时，至少一个 Slave 已重放该 WAL 偏移量；主库宕机时，提升该从库可避免数据丢失。
+- 代价：写延迟增加约 1 RTT；无 Slave 连接时超时降级，避免无限阻塞。
+- SQL 切换：`SET GLOBAL replication_type = 'SEMI_SYNC' | 'ASYNC'` 支持运行时切换。
+
+### 18.5 SQL 语法支持 | SQL Syntax Support | SQL 構文サポート
+
+```
+SET GLOBAL replication_type = 'SEMI_SYNC'
+SET GLOBAL replication_type = 'ASYNC'
+```
+
+---
+
+## 19. Phase 26b: AST Parser & Nested Loop Join
+## Phase 26b：基于 AST 的解析重构与关联查询试点
+## Phase 26b：AST ベースのパースリファクタリングと JOIN パイロット
+
+### 19.1 基于 AST 的执行计划树 | AST-Based Execution Plan Tree
+### 基于 AST の実行計画ツリー
+
+**Parse → Plan → Execute 三阶段**：
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│   Parse     │ ──► │      Plan        │ ──► │    Execute      │
+│ (sqlglot)   │     │ (ParsedSelect/   │     │ (scan/join/     │
+│ SELECT/INSERT│    │  ParsedInsert)   │     │  insert)        │
+└─────────────┘     └──────────────────┘     └─────────────────┘
+```
+
+- **Parse**：使用 sqlglot 解析 SELECT、INSERT，生成 AST；从 AST 提取字段、表名、WHERE、JOIN 条件。
+- **Plan**：ParsedSelect / ParsedInsert 即为执行计划；JOIN 时含 join_tables、join_on。
+- **Execute**：单表走 scan_with_condition；JOIN 走 _execute_join（Nested Loop）。
+
+SHOW TABLES、SAVEPOINT 等仍用正则解析；SELECT/INSERT 优先 AST，失败时回退正则。
+
+### 19.2 Nested Loop Join 物理执行过程 | Nested Loop Join Physical Execution
+### ネステッドループ JOIN 物理実行プロセス
+
+```mermaid
+flowchart TD
+    subgraph CBO["CBO: 小表驱动大表"]
+        A[比较 t1、t2 行数] --> B{n1 ≤ n2?}
+        B -->|是| C[Outer = t1, Inner = t2]
+        B -->|否| D[Outer = t2, Inner = t1]
+    end
+
+    subgraph NLJ["Nested Loop Join"]
+        C --> E[遍历 Outer 表每行]
+        D --> E
+        E --> F[取 join_key 值]
+        F --> G[Inner 表 index 查找]
+        G --> H{匹配?}
+        H -->|是| I[输出拼接行]
+        H -->|否| E
+        I --> E
+    end
+```
+
+**说明**：
+- 外层循环遍历小表（Outer），内层按 join 键在另一表（Inner）上做 `tree.search` 索引查找。
+- 语法：`SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.id = t2.id`
+- EXPLAIN 输出：Join Type、Outer Table、Inner Table、Join Condition、Cost_Outer、Cost_Inner_IndexLookup。
+
+### 19.3 EXPLAIN JOIN 输出 | EXPLAIN JOIN Output
+### EXPLAIN JOIN 出力
+
+| 项 | 说明 |
+|------|------|
+| Query Type | SELECT (JOIN) |
+| Join Type | NESTED_LOOP_JOIN |
+| Outer Table | 小表（行数少） |
+| Inner Table | 大表，按 join 键索引查找 |
+| Join Condition | t1.id = t2.id |
+| Cost_Outer | 外层全表扫描代价 |
+| Cost_Inner_IndexLookup | 内层索引查找代价 |
+
+---
+
+## 20. Phase 27: Storage Abstraction & Bloom Filter
+## Phase 27：存储抽象化与布隆过滤器加速
+## Phase 27：ストレージ抽象化とブルームフィルタ最適化
+
+### 20.1 存储引擎抽象 | Storage Engine Abstraction | ストレージエンジン抽象
+
+**目标**：实现存储引擎可插拔架构，将 B+ 树逻辑与上层 Table 解耦。
+
+**StorageEngine 协议**（`storage_engine.py`）：
+
+| 方法 | 说明 |
+|------|------|
+| **search(key)** | 点查，返回 value 或 None |
+| **insert(key, value)** | 插入键值对 |
+| **delete(key)** | 按 key 删除，不存在则 KeyError |
+| **range_scan(start_key, end_key)** | 范围扫描，迭代 (key, value) |
+
+**BPlusTreeEngine**：包装现有 `BPlusTree`，实现上述接口；暴露 `.tree` 属性供持久化、复制等兼容使用。
+
+**数据流**：`RowTable` 持有 `_engine: StorageEngine`（默认 `BPlusTreeEngine`），所有 search/insert/delete/scan 经引擎执行。
+
+### 20.2 内存布隆过滤器 | In-Memory Bloom Filter | メモリブルームフィルタ
+
+**逻辑**：在执行 `BPlusTree.search` 前先咨询布隆过滤器。若 `may_contain(key) == False`，则**一定不存在**，直接返回空结果，跳过 BufferPool/磁盘查询。
+
+**实现**（`bloom_filter.py`）：
+- 位数组（默认 8192 bits = 1KB）
+- k 个哈希函数（默认 3），基于 SHA256 切片
+- `add(key)`：插入时维护
+- `may_contain(key)`：False 表示一定不存在；True 表示可能存在（需底层确认）
+
+**集成**：`RowTable` 新增 `_bloom_filter`、`enable_bloom_filter` 参数；`_point_lookup` 先查布隆过滤器；`apply_insert`/`apply_delete` 同步更新过滤器；`refresh_stats()` 可重建过滤器（遍历 range_scan 并 add）。
+
+### 20.3 布隆过滤器在点查优化中的数学原理
+### Mathematical Principles of Bloom Filter in Point Lookup Optimization
+### 点検索最適化におけるブルームフィルタの数学原理
+
+**问题设定**：海量点查场景下，若大量查询的 key 实际不存在，每次都会触发 B+ 树遍历乃至磁盘 I/O。布隆过滤器可在 O(1) 内存访问内判定“一定不存在”，从而跳过昂贵查询。
+
+**假阳性率（False Positive Rate）**：
+
+设位数组大小为 \(m\)，已插入 \(n\) 个元素，使用 \(k\) 个哈希函数。单次哈希将某位设为 1 的概率为 \(1/m\)，未设为 1 的概率为 \(1 - 1/m\)。插入 \(n\) 个元素、每个用 \(k\) 次哈希后，某特定位仍为 0 的概率为：
+
+$$P_0 = \left(1 - \frac{1}{m}\right)^{kn} \approx e^{-kn/m}$$
+
+假阳性率：当查询一个不存在的 key 时，其 \(k\) 个哈希位**全部**已被其他元素置 1 的概率：
+
+$$f = \left(1 - P_0\right)^k = \left(1 - e^{-kn/m}\right)^k$$
+
+**最优 k**：给定 \(m/n\) 比值，使 \(f\) 最小的 \(k\) 为：
+
+$$k_{opt} = \frac{m}{n} \ln 2 \approx 0.693 \cdot \frac{m}{n}$$
+
+此时假阳性率约为 \(f \approx (0.6185)^{m/n}\)。
+
+**空间与精度折中**：
+
+| \(m/n\) (bits per element) | 最优 k | 假阳性率 \(f\) |
+|----------------------------|--------|----------------|
+| 8 | 6 | ~2.1% |
+| 12 | 8 | ~0.3% |
+| 16 | 11 | ~0.05% |
+
+**点查收益**：设点查中“key 不存在”的比例为 \(p_{absent}\)，每次底层查询成本为 \(C\)，布隆过滤器单次检查成本为 \(c \ll C\)。则：
+
+- **无过滤器**：每次查询成本 \(C\)
+- **有过滤器**：\(p_{absent}\) 比例直接返回，成本 \(c\)；\(1 - p_{absent}\) 比例需底层查询，成本 \(c + C\)；假阳性额外带来 \(f \cdot p_{absent}\) 比例的冗余底层查询
+
+期望成本（忽略假阳性时）：
+$$\mathbb{E}[\text{cost}] \approx p_{absent} \cdot c + (1 - p_{absent}) \cdot (c + C)$$
+
+当 \(p_{absent}\) 较大（如 50%）且 \(C \gg c\)（磁盘 I/O）时，可显著降低平均延迟与 IOPS。
+
+**实现参数**：当前 `BloomFilter` 默认 \(m=8192\)、\(k=3\)；对 \(n \approx 5000\) 时 \(m/n \approx 1.6\)，假阳性率较高；可通过 `num_bits`、`num_hashes` 调优。
+
+### 20.4 基准测试 | Benchmark | ベンチマーク
+
+**脚本**：`scripts/benchmark_filter.py`
+
+- 插入 5,000 条，执行 10,000 次随机点查（50% 不存在的 Key）
+- 对比 `enable_bloom_filter=True` 与 `False` 的耗时
+
+**说明**：纯内存模式下，B+ 树查找极快，布隆过滤器的哈希与位检查可能带来净开销；**有磁盘 I/O 时**（BufferPool 未命中、持久化表），布隆过滤器可大幅减少不必要的页读取。
+
+---
+
 ## References
 ## 参考文献
 ## 参考文献
 
 - PyBPlus-DBEngine 源码：`src/bplus_tree/`
-- 基准脚本：`scripts/benchmark.py`、`scripts/benchmark_concurrency.py`
+- 基准脚本：`scripts/benchmark.py`、`scripts/benchmark_concurrency.py`、`scripts/benchmark_filter.py`
 - 测试：`tests/test_*.py`
 
 ---
 
-*Document generated from Phase 1–Phase 25 implementation.  
-本白皮书基于 Phase 1 至 Phase 25 的完整实现生成。  
-Phase 1〜Phase 25 の実装に基づいて本ホワイトペーパーを生成しました。*
+*Document generated from Phase 1–Phase 27 implementation.  
+本白皮书基于 Phase 1 至 Phase 27 的完整实现生成。  
+Phase 1〜Phase 27 の実装に基づいて本ホワイトペーパーを生成しました。*
 
 ---
 

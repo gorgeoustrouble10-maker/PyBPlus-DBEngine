@@ -6,8 +6,9 @@ Chinese: 极简 SQL 解析器与执行引擎；支持 ORDER BY、LIMIT、COUNT(*
 Japanese: ミニマル SQL パーサーと実行エンジン；ORDER BY、LIMIT、COUNT(*)、SHOW TABLES、SHOW STATS 対応。
 """
 
+import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -55,9 +56,9 @@ class ParsedCreateTable:
 @dataclass
 class ParsedSelect:
     """
-    English: Parsed SELECT statement with ORDER BY, LIMIT, OFFSET, COUNT(*).
-    Chinese: 解析后的 SELECT 语句；支持 ORDER BY、LIMIT、OFFSET、COUNT(*)。
-    Japanese: パース済み SELECT 文；ORDER BY、LIMIT、OFFSET、COUNT(*) 対応。
+    English: Parsed SELECT statement with ORDER BY, LIMIT, OFFSET, COUNT(*), JOIN.
+    Chinese: 解析后的 SELECT 语句；支持 ORDER BY、LIMIT、OFFSET、COUNT(*)、JOIN。
+    Japanese: パース済み SELECT 文；ORDER BY、LIMIT、OFFSET、COUNT(*)、JOIN 対応。
     """
 
     columns: list[str]  # ["*"] or ["id", "name", ...] or ["COUNT(*)"] for aggregation
@@ -71,6 +72,9 @@ class ParsedSelect:
     limit: Optional[int] = None
     offset: Optional[int] = None
     is_count: bool = False
+    # Phase 26b: JOIN support
+    join_tables: list[tuple[str, str]] = field(default_factory=list)  # [(alias, table_name), ...]
+    join_on: list[tuple[str, str]] = field(default_factory=list)  # [(left_col, right_col), ...]
 
 
 @dataclass
@@ -86,6 +90,17 @@ class ParsedShowStats:
 @dataclass
 class ParsedShowHealth:
     """Parsed SHOW HEALTH statement."""
+
+
+@dataclass
+class ParsedSetGlobal:
+    """
+    English: Parsed SET GLOBAL var = value.
+    Chinese: 解析后的 SET GLOBAL var = value。
+    Japanese: パース済み SET GLOBAL var = value。
+    """
+    var: str
+    value: str
 
 
 @dataclass
@@ -147,11 +162,10 @@ class ParsedExplain:
 
 def parse_sql(
     sql: str,
-) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSavepoint | ParsedRollbackTo | ParsedExplain:
+) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSetGlobal | ParsedSavepoint | ParsedRollbackTo | ParsedExplain:
     """
     English: Parse SQL string; malformed SQL returns 1064 Syntax Error, never crashes.
-    Chinese: 解析 SQL；畸形 SQL 返回 1064 语法错误，不会导致进程崩溃。
-    Japanese: SQL をパース；不正 SQL は 1064 構文エラーを返し、クラッシュしない。
+    Phase 26b: SELECT/INSERT prefer AST (sqlglot); fallback to regex for other statements.
     """
     try:
         return _parse_sql_impl(sql)
@@ -163,13 +177,25 @@ def parse_sql(
 
 def _parse_sql_impl(
     sql: str,
-) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSavepoint | ParsedRollbackTo | ParsedExplain:
-    """Internal parse; exceptions converted by parse_sql."""
+) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSetGlobal | ParsedSavepoint | ParsedRollbackTo | ParsedExplain:
+    """Internal parse; Phase 26b: SELECT/INSERT try AST first."""
     sql = sql.strip().rstrip(";").strip()
     if not sql:
         raise EmptySQLError()
 
     upper = sql.upper()
+    if upper.startswith("SELECT"):
+        from bplus_tree.ast_parser import parse_with_ast
+        ast_parsed = parse_with_ast(sql, ParsedSelect, ParsedInsert)
+        if ast_parsed is not None:
+            return ast_parsed
+        return _parse_select(sql)
+    if upper.startswith("INSERT"):
+        from bplus_tree.ast_parser import parse_with_ast
+        ast_parsed = parse_with_ast(sql, ParsedSelect, ParsedInsert)
+        if ast_parsed is not None:
+            return ast_parsed
+        return _parse_insert(sql)
     if upper.startswith("EXPLAIN "):
         inner = sql[7:].strip().rstrip(";").strip()
         if not inner:
@@ -191,10 +217,8 @@ def _parse_sql_impl(
         return ParsedShowStats()
     if upper.startswith("SHOW HEALTH"):
         return ParsedShowHealth()
-    if upper.startswith("SELECT"):
-        return _parse_select(sql)
-    if upper.startswith("INSERT"):
-        return _parse_insert(sql)
+    if upper.startswith("SET GLOBAL"):
+        return _parse_set_global(sql)
     if upper.startswith("DELETE"):
         return _parse_delete(sql)
     if upper.startswith("SAVEPOINT"):
@@ -390,6 +414,24 @@ def _parse_value(s: str) -> Any:
         return s
 
 
+def _parse_set_global(sql: str) -> ParsedSetGlobal:
+    """Parse SET GLOBAL var = 'value' or SET GLOBAL var = value."""
+    m = re.match(
+        r"SET\s+GLOBAL\s+(\w+)\s*=\s*(.+)\s*$",
+        sql.strip(),
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        raise SQLSyntaxError("Invalid SET GLOBAL syntax; use: SET GLOBAL var = 'value'")
+    var = m.group(1).strip()
+    raw = m.group(2).strip()
+    if (raw.startswith("'") and raw.endswith("'")) or (
+        raw.startswith('"') and raw.endswith('"')
+    ):
+        raw = raw[1:-1]
+    return ParsedSetGlobal(var=var, value=raw)
+
+
 def _parse_insert(sql: str) -> ParsedInsert:
     """Parse INSERT INTO t (c1,c2) VALUES (v1,v2) or INSERT INTO t VALUES (v1,v2)."""
     m = re.match(
@@ -509,38 +551,61 @@ def _build_explain_output(
     rows: list[list[Any]] = []
     if isinstance(parsed, ParsedSelect):
         query_type = "SELECT"
-        tbl = _get_table(parsed.table)
-        if parsed.in_values is not None:
-            lo, hi = "IN(...)", f"IN({len(parsed.in_values)} vals)"
-            strategy = "INDEX_SCAN"
-            est_range = len(parsed.in_values)
+        if parsed.join_tables and parsed.join_on and db is not None:
+            t1 = _get_table(parsed.table)
+            _, t2_name = parsed.join_tables[0]
+            t2 = _get_table(t2_name)
+            n1, n2 = t1._total_rows, t2._total_rows
+            outer_tbl, inner_tbl = (t1, t2) if n1 <= n2 else (t2, t1)
+            outer_name = parsed.table if n1 <= n2 else t2_name
+            inner_name = t2_name if n1 <= n2 else parsed.table
+            lcol, rcol = parsed.join_on[0]
+            cost_outer = outer_tbl.compute_cost_table_scan()
+            cost_inner = inner_tbl.compute_cost_index_scan(min(n1, n2))
+            est_join_rows = n1 * min(1, n2) if n1 and n2 else 0
+            rows = [
+                ["Query Type", "SELECT (JOIN)"],
+                ["Join Type", "NESTED_LOOP_JOIN"],
+                ["Outer Table", f"{outer_name} ({outer_tbl._total_rows} rows)"],
+                ["Inner Table", f"{inner_name} ({inner_tbl._total_rows} rows)"],
+                ["Join Condition", f"{lcol} = {rcol}"],
+                ["Cost_Outer", f"{cost_outer:.1f}"],
+                ["Cost_Inner_IndexLookup", f"{cost_inner:.1f}"],
+                ["Estimated_Join_Rows", est_join_rows],
+            ]
         else:
-            lo = parsed.start_key if parsed.start_key is not None else "(-inf)"
-            hi = parsed.end_key if parsed.end_key is not None else "(+inf)"
-            strategy = tbl.choose_strategy(
-                parsed.start_key if parsed.start_key is not None else -(2**63),
-                parsed.end_key if parsed.end_key is not None else (2**63 - 1),
-            )
-            lo_n = parsed.start_key if parsed.start_key is not None else -(2**63)
-            hi_n = parsed.end_key if parsed.end_key is not None else (2**63 - 1)
-            est_range = (
-                max(0, int(hi_n) - int(lo_n) + 1)
-                if isinstance(lo_n, (int, float)) and isinstance(hi_n, (int, float))
-                else tbl._total_rows
-            )
-        scan_range = f"[{lo}, {hi}]" if strategy == "INDEX_SCAN" else "FULL"
-        filter_pred = parsed.where if parsed.where else "none"
-        cost_table = tbl.compute_cost_table_scan()
-        cost_index = tbl.compute_cost_index_scan(est_range)
-        rows = [
-            ["Query Type", query_type],
-            ["Execution Strategy", strategy],
-            ["Scan Range", str(scan_range)],
-            ["Filter Predicates", str(filter_pred)],
-            ["Cost_TableScan", f"{cost_table:.1f}"],
-            ["Cost_IndexScan", f"{cost_index:.1f}"],
-            ["Estimated_Range_Rows", est_range],
-        ]
+            tbl = _get_table(parsed.table)
+            if parsed.in_values is not None:
+                lo, hi = "IN(...)", f"IN({len(parsed.in_values)} vals)"
+                strategy = "INDEX_SCAN"
+                est_range = len(parsed.in_values)
+            else:
+                lo = parsed.start_key if parsed.start_key is not None else "(-inf)"
+                hi = parsed.end_key if parsed.end_key is not None else "(+inf)"
+                strategy = tbl.choose_strategy(
+                    parsed.start_key if parsed.start_key is not None else -(2**63),
+                    parsed.end_key if parsed.end_key is not None else (2**63 - 1),
+                )
+                lo_n = parsed.start_key if parsed.start_key is not None else -(2**63)
+                hi_n = parsed.end_key if parsed.end_key is not None else (2**63 - 1)
+                est_range = (
+                    max(0, int(hi_n) - int(lo_n) + 1)
+                    if isinstance(lo_n, (int, float)) and isinstance(hi_n, (int, float))
+                    else tbl._total_rows
+                )
+            scan_range = f"[{lo}, {hi}]" if strategy == "INDEX_SCAN" else "FULL"
+            filter_pred = parsed.where if parsed.where else "none"
+            cost_table = tbl.compute_cost_table_scan()
+            cost_index = tbl.compute_cost_index_scan(est_range)
+            rows = [
+                ["Query Type", query_type],
+                ["Execution Strategy", strategy],
+                ["Scan Range", str(scan_range)],
+                ["Filter Predicates", str(filter_pred)],
+                ["Cost_TableScan", f"{cost_table:.1f}"],
+                ["Cost_IndexScan", f"{cost_index:.1f}"],
+                ["Estimated_Range_Rows", est_range],
+            ]
     elif isinstance(parsed, ParsedInsert):
         rows = [["Query Type", "INSERT"], ["Target Table", parsed.table]]
     elif isinstance(parsed, ParsedDelete):
@@ -606,6 +671,85 @@ def _execute_show_stats(
     return ("(stats)", rows, ["metric", "value"])
 
 
+def _execute_join(
+    parsed: ParsedSelect,
+    db: Any,
+    tx: Optional[Any],
+    tx_manager: Optional[Any],
+    get_table: Any,
+) -> tuple[str, list[list[Any]], Optional[list[str]]]:
+    """
+    Phase 26b: Nested Loop Join execution.
+    CBO: smaller table as outer loop; for each outer row, index lookup on inner by join key.
+    """
+    t1_name = parsed.table
+    t2_alias, t2_name = parsed.join_tables[0]
+    t1 = get_table(t1_name)
+    t2 = get_table(t2_name)
+    lcol, rcol = parsed.join_on[0]
+    lkey = lcol.split(".")[-1]
+    rkey = rcol.split(".")[-1]
+
+    n1, n2 = t1._total_rows, t2._total_rows
+    if n1 <= n2:
+        outer_tbl, inner_tbl = t1, t2
+        outer_name, inner_name = t1_name, t2_name
+        outer_key, inner_key = lkey, rkey
+    else:
+        outer_tbl, inner_tbl = t2, t1
+        outer_name, inner_name = t2_name, t1_name
+        outer_key, inner_key = rkey, lkey
+
+    read_view = create_read_view(tx_manager, tx.tx_id) if tx and tx_manager else None
+
+    cols = parsed.columns
+    if cols == ["*"]:
+        cols = [f"{t1_name}.{n}" for n in t1._schema.field_names()] + [
+            f"{t2_name}.{n}" for n in t2._schema.field_names()
+        ]
+    out_names = [c.split(".")[-1] if "." in c else c for c in cols]
+
+    def _col_from_row(c: str, row_a: Any, row_b: Any, name_a: str, name_b: str) -> Any:
+        if "." in c:
+            t, f = c.split(".", 1)
+            fn = f.split(".")[-1]
+            if t == name_a:
+                return row_a.get_field(fn)
+            return row_b.get_field(fn)
+        for r, n in [(row_a, name_a), (row_b, name_b)]:
+            try:
+                return r.get_field(c)
+            except Exception:
+                pass
+        return None
+
+    rows: list[list[Any]] = []
+    for o_row in outer_tbl.scan_with_condition(lambda _: True, read_view=read_view):
+        key_val = o_row.get_field(outer_key)
+        i_raw = inner_tbl._point_lookup(key_val)
+        if i_raw is None:
+            continue
+        i_row = Tuple(inner_tbl._schema, raw=i_raw)
+        if read_view and not read_view.is_visible(i_row.tx_id):
+            continue
+        row_a = o_row if outer_name == t1_name else i_row
+        row_b = i_row if outer_name == t1_name else o_row
+        name_a = t1_name
+        name_b = t2_name
+        vals = [_col_from_row(c, row_a, row_b, name_a, name_b) for c in cols]
+        rows.append(vals)
+
+    if parsed.order_by_col:
+        sort_col = parsed.order_by_col.split(".")[-1] if "." in parsed.order_by_col else parsed.order_by_col
+        if sort_col in out_names:
+            rows.sort(key=lambda r: r[out_names.index(sort_col)], reverse=parsed.order_desc)
+    if parsed.offset is not None:
+        rows = rows[parsed.offset:]
+    if parsed.limit is not None:
+        rows = rows[: parsed.limit]
+    return (f"({len(rows)} rows)", rows, out_names)
+
+
 def _estimate_insert_size(values: list[Any]) -> int:
     """Estimate total byte size of INSERT values for security limit."""
     total = 0
@@ -626,16 +770,17 @@ def execute_sql(
     tx: Optional[Any] = None,
     tx_manager: Optional[Any] = None,
     replication_info: Optional[dict[str, Any]] = None,
+    replication_publisher: Optional[Any] = None,
+    replication_timeout: float = 0.1,
 ) -> tuple[str, list[list[Any]], Optional[list[str]]]:
     """
-    English: Execute SQL; use db for multi-table/CREATE, tx_manager for SHOW STATS.
-    Chinese: 执行 SQL；db 用于多表/CREATE，tx_manager 用于 SHOW STATS。
-    Japanese: SQL を実行；db でマルチテーブル/CREATE、tx_manager で SHOW STATS。
+    English: Execute SQL; Parse -> Plan -> Execute. Use db for multi-table/CREATE.
+    Chinese: 执行 SQL；三阶段 Parse→Plan→Execute；db 用于多表/CREATE。
 
     Returns:
         (status_message, rows, columns).
     """
-    parsed = parse_sql(sql)
+    parsed = parse_sql(sql)  # Parse: AST (sqlglot) or regex
 
     def _get_table(name: str) -> RowTable:
         if db is not None:
@@ -673,14 +818,33 @@ def execute_sql(
     if isinstance(parsed, ParsedShowHealth):
         return ("OK", [["status", "OK"]], ["metric", "value"])
 
+    if isinstance(parsed, ParsedSetGlobal):
+        if replication_info is None:
+            raise UnsupportedSQLError("SET GLOBAL requires replication_info (server mode)")
+        if parsed.var.lower() == "replication_type":
+            v = parsed.value.upper()
+            if v in ("SEMI_SYNC", "ASYNC"):
+                replication_info["replication_type"] = v
+                return (f"SET GLOBAL {parsed.var} = {v}", [], None)
+            raise SQLSyntaxError(
+                f"replication_type must be 'SEMI_SYNC' or 'ASYNC', got '{parsed.value}'"
+            )
+        raise SQLSyntaxError(f"Unknown global variable: {parsed.var}")
+
     if isinstance(parsed, ParsedSelect):
+        if parsed.join_tables and parsed.join_on and db is not None:
+            return _execute_join(parsed, db, tx, tx_manager, _get_table)
         tbl = _get_table(parsed.table)
         columns = parsed.columns
         schema = tbl._schema
         names = schema.field_names()
         if columns != ["*"] and not parsed.is_count:
             for c in columns:
-                if c not in names:
+                if "." in c:
+                    short = c.split(".")[-1]
+                    if short not in names and c not in names:
+                        raise UnknownColumnError(c)
+                elif c not in names:
                     raise UnknownColumnError(c)
             names = columns
         read_view = None
@@ -694,7 +858,13 @@ def execute_sql(
             in_values=parsed.in_values,
             read_view=read_view,
         ):
-            select_rows.append([r.get_field(n) for n in names])
+            row_vals = []
+            for n in names:
+                if "." in n:
+                    row_vals.append(r.get_field(n.split(".")[-1]))
+                else:
+                    row_vals.append(r.get_field(n))
+            select_rows.append(row_vals)
 
         if parsed.is_count:
             select_rows = [[len(select_rows)]]
@@ -702,9 +872,10 @@ def execute_sql(
             return ("(1 row)", select_rows, names)
 
         if parsed.order_by_col:
-            if parsed.order_by_col not in names:
+            col_for_sort = parsed.order_by_col.split(".")[-1] if "." in parsed.order_by_col else parsed.order_by_col
+            if col_for_sort not in names and parsed.order_by_col not in names:
                 raise UnknownColumnError(parsed.order_by_col)
-            col_idx = names.index(parsed.order_by_col)
+            col_idx = names.index(col_for_sort) if col_for_sort in names else names.index(parsed.order_by_col)
             select_rows.sort(key=lambda r: r[col_idx], reverse=parsed.order_desc)
 
         if parsed.offset is not None:
@@ -743,6 +914,28 @@ def execute_sql(
                 f"INSERT data size ({size} bytes) exceeds limit ({MAX_INSERT_BYTES})"
             )
         tbl.insert_row(values, transaction=tx)
+        if (
+            db is not None
+            and replication_publisher is not None
+            and replication_info is not None
+            and replication_info.get("replication_type") == "SEMI_SYNC"
+        ):
+            wal_path = getattr(db, "_data_dir", None)
+            if wal_path is not None:
+                wal_file = Path(wal_path) / f"wal_{parsed.table}.log"
+                offset = wal_file.stat().st_size if wal_file.exists() else 0
+                acked = replication_publisher.wait_for_ack(
+                    parsed.table, offset, replication_timeout
+                )
+                if not acked:
+                    logging.warning(
+                        "Semi-sync ACK timeout (%.0fms) for table %s offset %d; "
+                        "degrading to async replication.",
+                        replication_timeout * 1000,
+                        parsed.table,
+                        offset,
+                    )
+                    replication_info["replication_type"] = "ASYNC"
         return ("INSERT ok", [], None)
 
     if isinstance(parsed, ParsedDelete):
