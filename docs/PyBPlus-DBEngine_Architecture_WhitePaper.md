@@ -4,9 +4,9 @@
 
 ---
 
-**Version**: 1.9  
+**Version**: 2.1  
 **Date**: 2026  
-**Status**: Phase 1–Phase 24 (Query Profiling, WAL Replication)
+**Status**: Phase 1–Phase 25 (Cost Estimation, Auto-Failover)
 
 ---
 
@@ -28,6 +28,7 @@
 14. [Phase 19: Concurrency, Stress & Savepoints | Phase 19：并发、压力测试与保存点](#14-phase-19-concurrency-stress--savepoints)
 15. [Phase 21-22: Unified Persistence & Full MVCC | Phase 21-22：统一持久化与完整 MVCC](#15-phase-21-22-unified-persistence--full-mvcc)
 16. [Phase 24: Query Profiling & WAL Replication | Phase 24：执行计划分析与主从同步](#16-phase-24-query-profiling--wal-replication)
+17. [Phase 25: Cost Estimation & Auto-Failover | Phase 25：代价模型与自动故障转移](#17-phase-25-cost-estimation--auto-failover)
 
 ---
 
@@ -702,6 +703,42 @@ flowchart TB
 
 ---
 
+## 17. Phase 25: Cost Estimation & Auto-Failover
+## Phase 25：代价模型与自动故障转移
+## Phase 25：コスト推定と自動フェイルオーバー
+
+### 17.1 基于代价的优化模型 | Cost-Based Optimization Model | コストベース最適化モデル
+
+**统计信息 (TableStats)**：
+- `total_rows`：表总行数（insert/delete 时更新，refresh_stats 重算）
+- `index_cardinality`：索引唯一值数（主键场景等于 total_rows）
+
+**代价公式**：
+```
+Cost_TableScan = total_rows × 1.0
+Cost_IndexScan = estimated_range_rows × 0.5 + 10   (10 为索引寻道常数)
+```
+
+**决策规则**：
+- 若 `Cost_IndexScan > Cost_TableScan`，强制 TABLE_SCAN
+- 否则，若 `estimated_range / total_rows > 0.3`，TABLE_SCAN
+- 其余情况走 INDEX_SCAN
+
+**EXPLAIN 输出增强**：新增 `Cost_TableScan`、`Cost_IndexScan`、`Estimated_Range_Rows` 行。
+
+### 17.2 自动故障转移 | Auto-Failover | 自動フェイルオーバー
+
+- **Health Check**：Slave 监控线程每 0.2 秒检查一次；若自上次接收 WAL 起超过 5 秒无心跳，触发 `promote_to_master()`。
+- **角色切换**：`promote_to_master()` 停止订阅、将 `node_role` 设为 MASTER；提升后的实例可接受客户端写请求并写入本地 WAL。
+- **可配置超时**：`ReplicationSubscriber` 支持 `failover_timeout_sec` 参数（默认 5 秒）。
+
+### 17.3 复杂 SQL 增强 | Complex SQL | 複雑 SQL 強化
+
+- **WHERE col IN (val1, val2, ...)**：多值匹配，对主键列执行点查，利用索引。
+- 解析 `col IN (v1, v2, v3)` 得到 `in_values`，扫描时对每个 value 调用 `tree.search(k)`。
+
+---
+
 ## References
 ## 参考文献
 ## 参考文献
@@ -712,9 +749,9 @@ flowchart TB
 
 ---
 
-*Document generated from Phase 1–Phase 24 implementation.  
-本白皮书基于 Phase 1 至 Phase 24 的完整实现生成。  
-Phase 1〜Phase 24 の実装に基づいて本ホワイトペーパーを生成しました。*
+*Document generated from Phase 1–Phase 25 implementation.  
+本白皮书基于 Phase 1 至 Phase 25 的完整实现生成。  
+Phase 1〜Phase 25 の実装に基づいて本ホワイトペーパーを生成しました。*
 
 ---
 

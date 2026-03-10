@@ -93,6 +93,17 @@ class TestSQLExecute:
         assert by_item["Query Type"] == "INSERT"
         assert by_item["Target Table"] == "t"
 
+    def test_where_in(self) -> None:
+        """Phase 25: WHERE id IN (1, 2, 3) 多值匹配。"""
+        schema = Schema(fields=[("id", "INT"), ("name", "VARCHAR(32)")])
+        table = RowTable(schema, primary_key="id")
+        for i in range(1, 6):
+            execute_sql(f"INSERT INTO t (id, name) VALUES ({i}, 'v{i}')", table)
+        msg, rows, _ = execute_sql("SELECT * FROM t WHERE id IN (1, 3, 5)", table)
+        assert len(rows) == 3
+        ids = sorted(r[0] for r in rows)
+        assert ids == [1, 3, 5]
+
 
 class TestCreateTable:
     """CREATE TABLE 解析与执行测试。"""

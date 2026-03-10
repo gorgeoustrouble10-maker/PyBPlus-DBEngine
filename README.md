@@ -75,7 +75,10 @@ flowchart TB
 | **WAL Recovery** | Crash-safe; replay committed transactions on restart | 崩溃安全；重启时重放已提交事务 |
 | **Latch Crabbing** | B-Link tree with high_key/right_sibling; lock crabbing ready | B-Link 树结构，锁螃蟹算法就绪 |
 | **BufferPool** | LRU cache, FSM, slotted page layout | LRU 缓冲池、空闲页复用、槽位页 |
-| **76+ Core Tests** | Full test coverage for tree, SQL, transactions | 树、SQL、事务全链路测试 |
+| **76+ Core Tests** | Full test coverage (80 tests) for tree, SQL, transactions | 树、SQL、事务全链路测试 |
+| **CBO Cost Model** | Cost_TableScan / Cost_IndexScan; EXPLAIN shows estimated cost | 代价模型、EXPLAIN 预估 |
+| **Auto-Failover** | Slave promotes to Master after 5s no heartbeat | 5 秒无心跳自动提升 |
+| **WHERE IN** | Multi-value matching; index point lookups | 多值匹配、索引点查 |
 
 ---
 
@@ -138,6 +141,19 @@ docker-compose up -d
 # Data persisted in volume: pybplus_db_data
 ```
 
+### Master-Slave Cluster | 主从集群
+
+```bash
+# Master (SQL 8765, 复制 8767)
+python scripts/run_server.py -d ./data_master -P 8765 --replication-port 8767
+
+# Slave (另终端)
+python scripts/run_server.py -d ./data_slave -P 8766 --slave-of 127.0.0.1:8767
+
+# 一键启动 (Linux/macOS)
+./scripts/start_cluster.sh
+```
+
 ### Cloud Deployment | 上云部署 | クラウドデプロイ
 
 | Platform | 说明 |
@@ -146,6 +162,8 @@ docker-compose up -d
 | **K8s** | 使用 `Dockerfile` 构建镜像，挂载 PVC 至 `/data` |
 | **AWS ECS / GCP Cloud Run** | 构建镜像 → 推送到 ECR/AR → 部署；挂载 EFS/Cloud Storage 至 `/data` |
 | **Heroku / Railway** | 注意：Ephemeral 文件系统，需外部存储（如 S3）持久化数据 |
+
+**优化建议**：生产环境建议 Master + Slave 部署，利用 `--replication-port` 与 `--slave-of` 实现高可用；Slave 5 秒无心跳自动提升为主。
 
 ---
 
@@ -190,3 +208,16 @@ PyBPlus-DBEngine/
 ## 📜 License
 
 MIT
+
+---
+
+## 项目感悟 | Project Reflection | プロジェクト所感
+
+从 Phase 1 到 Phase 25，PyBPlus-DBEngine 已形成一条**从存储到分布式**的完整技术链：
+
+1. **存储层**：BufferPool、Slotted Page、FSM、WAL、Checkpoint，与工业级数据库的页式存储思路一致。
+2. **并发层**：MVCC、ReadView、Latch Crabbing 雏形，足以支撑读已提交与高并发演示。
+3. **SQL 层**：解析、执行、EXPLAIN、CBO 代价模型，已具备基础的优化器能力。
+4. **分布式层**：WAL 主从复制、自动故障转移，为后续 Raft 等共识协议留出演进空间。
+
+**整体水平**：作为教学/简历项目，已达**生产级原型**水准；与 RocksDB/PostgreSQL 的差距主要体现在优化器深度、锁粒度与分布式共识。适合作为数据库内核学习的完整样本。

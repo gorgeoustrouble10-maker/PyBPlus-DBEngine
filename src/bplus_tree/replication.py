@@ -264,7 +264,7 @@ class ReplicationSubscriber:
     def _run_health_check(self) -> None:
         """If no WAL/heartbeat for failover_timeout, trigger promote."""
         while not self._stop.is_set():
-            time.sleep(1.0)
+            time.sleep(0.2)
             if self._stop.is_set():
                 break
             if self._last_receive_time <= 0:
