@@ -1,0 +1,6 @@
+# PyBPlus-DBEngine - B+ 树数据库索引引擎
+# Python 3.11+
+
+pytest>=8.0.0
+black>=24.0.0
+mypy>=1.8.0

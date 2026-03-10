@@ -1,0 +1,187 @@
+"""
+多线程 TCP 数据库服务器；Wire Protocol [Length][Payload]。
+
+English: Multi-threaded TCP database server; Wire Protocol [Length][Payload].
+Chinese: 多线程 TCP 数据库服务器；Wire Protocol [Length][Payload]。
+Japanese: マルチスレッド TCP データベースサーバー；Wire Protocol [Length][Payload]。
+"""
+
+import struct
+import socketserver
+from pathlib import Path
+from typing import Any, Optional
+
+from bplus_tree.errors import DBError
+from bplus_tree.table import RowTable
+from bplus_tree.transaction import TransactionManager
+from bplus_tree.sql_engine import execute_sql
+
+# Wire Protocol: [4 bytes length LE][payload UTF-8]
+MSG_HEADER_LEN: int = 4
+
+
+def _encode_response_correct(
+    status: str,
+    message: str,
+    rows: list[list[Any]],
+    columns: Optional[list[str]] = None,
+) -> bytes:
+    """Encode response: STATUS\\nmessage\\n[header_row\\n]data_rows."""
+    lines = [status, message]
+    if rows:
+        if columns:
+            lines.append("\t".join(columns))
+        for r in rows:
+            lines.append("\t".join(str(v) for v in r))
+    return "\n".join(lines).encode("utf-8")
+
+
+class DBRequestHandler(socketserver.BaseRequestHandler):
+    """
+    English: Handle one client connection; maintains per-connection Transaction.
+    Chinese: 处理单客户端连接；每连接维护独立 Transaction。
+    Japanese: 1 クライアント接続を処理；接続ごとに Transaction を保持。
+    """
+
+    def setup(self) -> None:
+        self._tx: Optional[Any] = None
+        self._tx_manager = getattr(self.server, "tx_manager", None)
+        self._table = getattr(self.server, "table", None)
+        self._db = getattr(self.server, "db", None)
+
+    def _get_table_for_rollback(self) -> Optional[RowTable]:
+        if self._db is not None:
+            return self._db.get_primary_table()
+        return self._table
+
+    def handle(self) -> None:
+        db = self._db
+        table = self._table
+        if db is None and table is None:
+            self._send_error("[1049] No database or table configured")
+            return
+        tx_manager = self._tx_manager
+        while True:
+            try:
+                raw = self._read_message()
+                if raw is None:
+                    break
+                sql = raw.decode("utf-8").strip()
+                if not sql:
+                    continue
+                if sql.upper() in ("QUIT", "EXIT", "BYE"):
+                    break
+                if sql.upper().startswith("BEGIN"):
+                    if tx_manager and self._tx is None:
+                        self._tx = tx_manager.begin()
+                        self._send_ok("Transaction started")
+                    continue
+                if sql.upper().startswith("COMMIT"):
+                    if self._tx and tx_manager:
+                        tx_manager.commit(self._tx)
+                        self._tx = None
+                        self._send_ok("Committed")
+                    continue
+                if sql.upper().startswith("ROLLBACK"):
+                    rollback_table = self._get_table_for_rollback()
+                    if self._tx and tx_manager and rollback_table:
+                        rollback_table.rollback_transaction(self._tx)
+                        tx_manager.abort(self._tx)
+                        self._tx = None
+                        self._send_ok("Rolled back")
+                    continue
+
+                if db is not None:
+                    msg, rows, columns = execute_sql(sql, db=db, tx=self._tx)
+                else:
+                    msg, rows, columns = execute_sql(sql, table=table, tx=self._tx)
+                payload = _encode_response_correct("OK", msg, rows, columns)
+                self._send_raw(payload)
+            except DBError as e:
+                self._send_error(e.format_for_wire())
+            except Exception as e:
+                self._send_error(f"[1050] {e}")
+
+    def _read_message(self) -> Optional[bytes]:
+        """Read [Length][Payload] from socket."""
+        try:
+            header = self.request.recv(MSG_HEADER_LEN)
+            if len(header) < MSG_HEADER_LEN:
+                return None
+            length = struct.unpack("<I", header)[0]
+            if length > 1024 * 1024:
+                return None
+            data = b""
+            while len(data) < length:
+                chunk = self.request.recv(length - len(data))
+                if not chunk:
+                    return None
+                data += chunk
+            return data
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            return None
+
+    def _send_raw(self, payload: bytes) -> None:
+        try:
+            self.request.sendall(struct.pack("<I", len(payload)) + payload)
+        except (BrokenPipeError, OSError):
+            pass
+
+    def _send_ok(self, msg: str) -> None:
+        self._send_raw(_encode_response_correct("OK", msg, []))
+
+    def _send_error(self, err: str) -> None:
+        self._send_raw(_encode_response_correct("ERROR", err, []))
+
+
+class DBServer(socketserver.ThreadingTCPServer):
+    """
+    English: TCP server with table/db and tx_manager attributes.
+    Chinese: 带 table/db 与 tx_manager 属性的 TCP 服务器。
+    Japanese: table/db と tx_manager 属性を持つ TCP サーバー。
+    """
+
+    table: Optional[RowTable] = None
+    tx_manager: Optional[Any] = None
+    db: Optional[Any] = None
+
+
+def run_server(
+    table: Optional[RowTable] = None,
+    db: Optional[Any] = None,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+) -> None:
+    """
+    English: Start multi-threaded TCP server; use db (with recovery) or table.
+    Chinese: 启动多线程 TCP 服务器；使用 db（含恢复）或单表。
+    Japanese: マルチスレッド TCP サーバーを起動；db（リカバリ付き）または table。
+    """
+    if table is None and db is None:
+        raise ValueError("Either table or db must be provided")
+    with DBServer((host, port), DBRequestHandler) as server:
+        server.table = table
+        server.db = db
+        server.tx_manager = TransactionManager()
+        server.daemon_threads = True
+        server.allow_reuse_address = True
+        print(f"PyBPlus-DB Server on {host}:{port}")
+        server.serve_forever()
+
+
+def run_server_with_recovery(
+    data_dir: str | Path,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+) -> None:
+    """
+    English: Start server with Catalog + WAL recovery; CREATE TABLE supported.
+    Chinese: 启动服务器，加载 Catalog 并执行 WAL 恢复；支持 CREATE TABLE。
+    Japanese: Catalog と WAL リカバリでサーバーを起動；CREATE TABLE 対応。
+    """
+    from bplus_tree.database_context import DatabaseContext
+
+    ctx = DatabaseContext(Path(data_dir) if not isinstance(data_dir, Path) else data_dir)
+    ctx.load_tables()
+    ctx.run_recovery()
+    run_server(db=ctx, host=host, port=port)

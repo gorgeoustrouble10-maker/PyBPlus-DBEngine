@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project]
+name = "pybplus-dbengine"
+version = "0.1.0"
+description = "基于 B+ 树的极简数据库索引模块（模拟磁盘页设计）"
+requires-python = ">=3.11"
+dependencies = [
+    "pytest>=8.0.0",
+    "black>=24.0.0",
+    "mypy>=1.8.0",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py311"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
