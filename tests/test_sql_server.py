@@ -100,6 +100,88 @@ class TestCreateTable:
         assert "[1146]" in e2.format_for_wire()
 
 
+class TestPhase17:
+    """Phase 17: 多表事务回滚、DROP TABLE 持久化。"""
+
+    def test_global_rollback(self) -> None:
+        """事务修改 Table A 后修改 Table B 失败，验证 A 是否回滚。"""
+        import tempfile
+        from pathlib import Path
+        from bplus_tree.database_context import DatabaseContext
+        from bplus_tree.transaction import TransactionManager
+        from bplus_tree.sql_engine import execute_sql
+
+        with tempfile.TemporaryDirectory() as d:
+            ctx = DatabaseContext(Path(d))
+            execute_sql("CREATE TABLE a (id INT, x VARCHAR(8))", db=ctx)
+            execute_sql("CREATE TABLE b (id INT, y VARCHAR(8))", db=ctx)
+            tx_mgr = TransactionManager()
+            tx = tx_mgr.begin()
+
+            execute_sql("INSERT INTO a (id, x) VALUES (1, 'v')", db=ctx, tx=tx)
+            rows_a = list(ctx.get_table("a").scan_with_condition(lambda _: True))
+            assert len(rows_a) == 1
+
+            try:
+                execute_sql(
+                    "DELETE FROM b WHERE id = 999",
+                    db=ctx,
+                    tx=tx,
+                )
+            except KeyError:
+                pass
+
+            tx.rollback()
+            tx_mgr.abort(tx)
+
+            rows_a_after = list(ctx.get_table("a").scan_with_condition(lambda _: True))
+            assert len(rows_a_after) == 0
+
+    def test_drop_table_persistence(self) -> None:
+        """重启后验证 Catalog 是否确实删除了该表。"""
+        import tempfile
+        from pathlib import Path
+        from bplus_tree.database_context import DatabaseContext
+        from bplus_tree.sql_engine import execute_sql
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d)
+            ctx = DatabaseContext(path)
+            execute_sql("CREATE TABLE x (id INT, v VARCHAR(16))", db=ctx)
+            execute_sql("CREATE TABLE y (id INT, v VARCHAR(16))", db=ctx)
+            assert "x" in ctx._catalog.list_tables()
+            assert "y" in ctx._catalog.list_tables()
+
+            ctx.drop_table("x")
+            assert "x" not in ctx._catalog.list_tables()
+            assert "y" in ctx._catalog.list_tables()
+
+            ctx2 = DatabaseContext(path)
+            ctx2.load_tables()
+            assert "x" not in ctx2._catalog.list_tables()
+            assert "y" in ctx2._catalog.list_tables()
+            assert "y" in ctx2._tables
+
+    def test_parse_drop_table(self) -> None:
+        p = parse_sql("DROP TABLE users")
+        assert p.table == "users"
+
+    def test_execute_drop_table(self) -> None:
+        import tempfile
+        from pathlib import Path
+        from bplus_tree.database_context import DatabaseContext
+        from bplus_tree.sql_engine import execute_sql
+
+        with tempfile.TemporaryDirectory() as d:
+            ctx = DatabaseContext(Path(d))
+            execute_sql("CREATE TABLE z (id INT PRIMARY KEY)", db=ctx)
+            assert "z" in ctx._catalog.list_tables()
+
+            msg, _, _ = execute_sql("DROP TABLE z", db=ctx)
+            assert "DROP TABLE ok" in msg
+            assert "z" not in ctx._catalog.list_tables()
+
+
 class TestWireProtocol:
     """Wire Protocol 编码测试。"""
 

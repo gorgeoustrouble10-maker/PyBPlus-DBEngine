@@ -22,6 +22,16 @@ from bplus_tree.table import RowTable, Tuple
 
 
 @dataclass
+class ParsedDropTable:
+    """
+    English: Parsed DROP TABLE statement.
+    Chinese: 解析后的 DROP TABLE 语句。
+    Japanese: パース済み DROP TABLE 文。
+    """
+    table: str
+
+
+@dataclass
 class ParsedCreateTable:
     """
     English: Parsed CREATE TABLE statement.
@@ -75,7 +85,7 @@ class ParsedDelete:
     pk_value: Optional[Any] = None  # 若 WHERE id = N 则提取出 N
 
 
-def parse_sql(sql: str) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable:
+def parse_sql(sql: str) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable:
     """
     English: Parse SQL string into SELECT/INSERT/DELETE/CREATE TABLE structure.
     Chinese: 将 SQL 字符串解析为 SELECT/INSERT/DELETE/CREATE TABLE 结构。
@@ -83,6 +93,7 @@ def parse_sql(sql: str) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCr
 
     Supported forms:
     - CREATE TABLE name (col1 INT, col2 VARCHAR(32), ...)
+    - DROP TABLE name
     - SELECT * FROM t [WHERE id >= 1 AND id <= 10]
     - INSERT INTO t (col1, col2) VALUES (v1, v2)
     - DELETE FROM t WHERE id = 5
@@ -94,6 +105,8 @@ def parse_sql(sql: str) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCr
     upper = sql.upper()
     if upper.startswith("CREATE TABLE"):
         return _parse_create_table(sql)
+    if upper.startswith("DROP TABLE"):
+        return _parse_drop_table(sql)
     if upper.startswith("SELECT"):
         return _parse_select(sql)
     if upper.startswith("INSERT"):
@@ -140,6 +153,18 @@ def _parse_create_table(sql: str) -> ParsedCreateTable:
     if not primary_key:
         raise SQLSyntaxError("CREATE TABLE requires a primary key")
     return ParsedCreateTable(table=table_name, columns=columns, primary_key=primary_key)
+
+
+def _parse_drop_table(sql: str) -> ParsedDropTable:
+    """
+    English: Parse DROP TABLE name.
+    Chinese: 解析 DROP TABLE name。
+    Japanese: DROP TABLE name をパース。
+    """
+    m = re.match(r"DROP\s+TABLE\s+(\w+)", sql, re.IGNORECASE)
+    if not m:
+        raise SQLSyntaxError("Invalid DROP TABLE syntax")
+    return ParsedDropTable(table=m.group(1).strip())
 
 
 def _parse_select(sql: str) -> ParsedSelect:
@@ -311,6 +336,12 @@ def execute_sql(
         schema = Schema(fields=parsed.columns)
         db.create_table(parsed.table, schema, parsed.primary_key)
         return ("CREATE TABLE ok", [], None)
+
+    if isinstance(parsed, ParsedDropTable):
+        if db is None:
+            raise UnsupportedSQLError("DROP TABLE requires DatabaseContext")
+        db.drop_table(parsed.table)
+        return ("DROP TABLE ok", [], None)
 
     if isinstance(parsed, ParsedSelect):
         tbl = _get_table(parsed.table)

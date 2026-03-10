@@ -26,15 +26,16 @@ ROLL_PTR_NONE: int = 0
 @dataclass
 class UndoRecord:
     """
-    English: Single undo record; before_image for physical rollback.
-    Chinese: 单条 Undo 记录；before_image 用于物理回滚。
-    Japanese: 単一 Undo レコード；before_image で物理ロールバック。
+    English: Single undo record; before_image for physical rollback; table for multi-table rollback.
+    Chinese: 单条 Undo 记录；before_image 用于物理回滚；table 用于多表回滚。
+    Japanese: 単一 Undo レコード；before_image で物理ロールバック；table でマルチテーブルロールバック。
     """
 
     op: str  # "INSERT" | "DELETE"
     key: Any
     before_image: Optional[bytes]  # 修改前值；INSERT 时为 None
     after_image: Optional[bytes]  # 修改后值；DELETE 时为 None
+    table: Any = None  # RowTable 引用；用于多表逆序回滚
 
 
 class TxState(Enum):
@@ -65,6 +66,15 @@ class Transaction:
         self._tx_id: int = tx_id
         self._state: TxState = TxState.ACTIVE
         self._undo_records: list[UndoRecord] = []
+        self._involved_tables: set[Any] = set()
+
+    def register_table(self, table: Any) -> None:
+        """
+        English: Register table involved in this transaction (for multi-table rollback).
+        Chinese: 注册本事务涉及的表（用于多表回滚）。
+        Japanese: 本トランザクションに関与するテーブルを登録（マルチテーブルロールバック用）。
+        """
+        self._involved_tables.add(table)
 
     @property
     def tx_id(self) -> int:
@@ -76,24 +86,36 @@ class Transaction:
         """Current transaction state."""
         return self._state
 
-    def log_insert_undo(self, key: Any, value: bytes) -> None:
+    def log_insert_undo(self, key: Any, value: bytes, table: Any = None) -> None:
         """
-        English: Record INSERT for undo; rollback will delete key.
-        Chinese: 记录 INSERT 的 Undo；回滚时删除 key。
-        Japanese: INSERT の Undo を記録；ロールバック時に key を削除。
+        English: Record INSERT for undo; rollback will delete key. Table ref for multi-table rollback.
+        Chinese: 记录 INSERT 的 Undo；回滚时删除 key。table 用于多表回滚。
+        Japanese: INSERT の Undo を記録；ロールバック時に key を削除。table でマルチテーブル。
         """
         self._undo_records.append(
-            UndoRecord(op="INSERT", key=key, before_image=None, after_image=value)
+            UndoRecord(
+                op="INSERT",
+                key=key,
+                before_image=None,
+                after_image=value,
+                table=table,
+            )
         )
 
-    def log_delete_undo(self, key: Any, before_value: bytes) -> None:
+    def log_delete_undo(self, key: Any, before_value: bytes, table: Any = None) -> None:
         """
-        English: Record DELETE for undo; rollback will restore before_value.
-        Chinese: 记录 DELETE 的 Undo；回滚时恢复 before_value。
-        Japanese: DELETE の Undo を記録；ロールバック時に before_value を復元。
+        English: Record DELETE for undo; rollback will restore before_value. Table ref for multi-table.
+        Chinese: 记录 DELETE 的 Undo；回滚时恢复 before_value。table 用于多表回滚。
+        Japanese: DELETE の Undo を記録；ロールバック時に before_value を復元。table でマルチテーブル。
         """
         self._undo_records.append(
-            UndoRecord(op="DELETE", key=key, before_image=before_value, after_image=None)
+            UndoRecord(
+                op="DELETE",
+                key=key,
+                before_image=before_value,
+                after_image=None,
+                table=table,
+            )
         )
 
     def commit(self) -> None:
@@ -117,25 +139,27 @@ class Transaction:
             raise RuntimeError(f"Cannot abort transaction in state {self._state}")
         self._state = TxState.ABORTED
 
-    def rollback(self, tree: Any) -> None:
+    def rollback(self, tree: Any = None) -> None:
         """
-        English: Physical rollback: apply undo records in reverse, restore page data.
-        Chinese: 物理回滚：逆序应用 Undo 记录，还原页数据。
-        Japanese: 物理ロールバック：Undo レコードを逆順に適用し、ページデータを復元。
-
-        Args:
-            tree: BPlusTree to undo modifications on (must have delete/insert).
+        English: Physical rollback: apply undo records in reverse (LIFO), restore page data.
+        Multi-table: each UndoRecord carries table ref; fallback to tree if given (legacy).
+        Chinese: 物理回滚：逆序（LIFO）应用 Undo 记录，还原页数据。多表时每记录含 table；兼容单表 tree 参数。
+        Japanese: 物理ロールバック：Undo を逆順（LIFO）適用、ページを復元。マルチテーブル時は各 rec に table。
         """
         if self._state != TxState.ACTIVE:
             raise RuntimeError(f"Cannot rollback transaction in state {self._state}")
         for rec in reversed(self._undo_records):
+            t = rec.table if rec.table is not None else tree
+            if t is None:
+                continue
+            target = getattr(t, "_tree", t)
             if rec.op == "INSERT":
                 try:
-                    tree.delete(rec.key)
+                    target.delete(rec.key)
                 except KeyError:
                     pass
             elif rec.op == "DELETE" and rec.before_image is not None:
-                tree.insert(rec.key, rec.before_image)
+                target.insert(rec.key, rec.before_image)
         self._undo_records = []
         self._state = TxState.ABORTED
 

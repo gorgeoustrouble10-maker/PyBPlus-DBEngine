@@ -6,11 +6,13 @@ Chinese: 数据库上下文：多表管理、Catalog、恢复。
 Japanese: データベースコンテキスト：マルチテーブル管理、Catalog、リカバリ。
 """
 
+import os
 from pathlib import Path
 from typing import Any, Optional
 
+from bplus_tree.background import truncate_wal_after_checkpoint
 from bplus_tree.catalog import Catalog
-from bplus_tree.errors import UnknownTableError
+from bplus_tree.errors import TableInUseError, UnknownTableError
 from bplus_tree.logging import WriteAheadLog
 from bplus_tree.schema import Schema
 from bplus_tree.table import RowTable
@@ -132,3 +134,47 @@ class DatabaseContext:
         if self._primary_table:
             return self._tables.get(self._primary_table)
         return next(iter(self._tables.values())) if self._tables else None
+
+    def drop_table(self, name: str) -> None:
+        """
+        English: Drop table; reclaim resources (WAL file), update catalog.
+        Chinese: 删除表；回收资源（WAL 文件），更新 Catalog。
+        Japanese: テーブルを削除；リソース（WAL ファイル）を回収、Catalog を更新。
+
+        Pre-condition: Caller should hold exclusive access; no active transactions on this table.
+        Safety: Catches PermissionError when file is in use, raises TableInUseError.
+        """
+        if name not in self._tables:
+            raise UnknownTableError(name)
+        table = self._tables.pop(name)
+        if self._primary_table == name:
+            self._primary_table = next(iter(self._tables.keys()), None) if self._tables else None
+        self._catalog.remove_table(name)
+        wal_path = self._data_dir / f"wal_{name}.log"
+        if wal_path.exists():
+            try:
+                wal_path.unlink()
+            except PermissionError:
+                self._tables[name] = table
+                self._catalog.add_table(name, table._schema, table._pk)
+                raise TableInUseError(name)
+        db_path = self._data_dir / f"{name}.db"
+        idx_path = self._data_dir / f"{name}.idx"
+        for p in (db_path, idx_path):
+            if p.exists():
+                try:
+                    os.remove(p)
+                except PermissionError:
+                    pass
+
+    def checkpoint_all(self) -> None:
+        """
+        English: Checkpoint all table WALs; fsync semantics via log_checkpoint, then truncate.
+        Chinese: 对所有表 WAL 执行 Checkpoint；通过 log_checkpoint 落盘，再截断。
+        Japanese: 全テーブル WAL をチェックポイント；log_checkpoint で永続化後 truncate。
+        """
+        for name, table in list(self._tables.items()):
+            wal = getattr(table._tree, "_wal", None)
+            if wal is not None:
+                wal.log_checkpoint()
+            truncate_wal_after_checkpoint(self._data_dir / f"wal_{name}.log")

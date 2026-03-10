@@ -102,3 +102,14 @@ class Catalog:
     def has_table(self, name: str) -> bool:
         """Whether table exists."""
         return name in self._tables
+
+    def remove_table(self, name: str) -> None:
+        """
+        English: Remove table from catalog; persist.
+        Chinese: 从 Catalog 删除表并持久化。
+        Japanese: Catalog からテーブルを削除し永続化。
+        """
+        if name not in self._tables:
+            raise UnknownTableError(name)
+        del self._tables[name]
+        self.save()

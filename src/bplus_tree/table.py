@@ -165,7 +165,8 @@ class RowTable:
         roll_ptr = 0
         raw = row.to_bytes(tx_id=tx_id, roll_pointer=roll_ptr)
         if transaction is not None:
-            transaction.log_insert_undo(key, raw)
+            transaction.register_table(self)
+            transaction.log_insert_undo(key, raw, table=self)
         self._tree.insert(key, raw)
         self._total_rows += 1
 
@@ -183,7 +184,8 @@ class RowTable:
         if raw is None:
             raise KeyError(f"Primary key {key} not found")
         if transaction is not None:
-            transaction.log_delete_undo(key, raw)
+            transaction.register_table(self)
+            transaction.log_delete_undo(key, raw, table=self)
         self._tree.delete(key)
         self._total_rows = max(0, self._total_rows - 1)
 
@@ -263,8 +265,8 @@ class RowTable:
 
     def rollback_transaction(self, transaction: Any) -> None:
         """
-        English: Physical rollback of transaction's modifications on this table.
-        Chinese: 物理回滚该事务在本表上的修改。
-        Japanese: 本テーブルに対するトランザクションの変更を物理ロールバック。
+        English: Physical rollback of transaction's modifications (all involved tables).
+        Chinese: 物理回滚该事务的修改（所有涉及表，多表原子回滚）。
+        Japanese: トランザクションの変更を物理ロールバック（全関与テーブル、マルチテーブル原子）。
         """
-        transaction.rollback(self._tree)
+        transaction.rollback()

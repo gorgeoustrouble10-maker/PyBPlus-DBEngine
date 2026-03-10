@@ -49,11 +49,6 @@ class DBRequestHandler(socketserver.BaseRequestHandler):
         self._table = getattr(self.server, "table", None)
         self._db = getattr(self.server, "db", None)
 
-    def _get_table_for_rollback(self) -> Optional[RowTable]:
-        if self._db is not None:
-            return self._db.get_primary_table()
-        return self._table
-
     def handle(self) -> None:
         db = self._db
         table = self._table
@@ -83,9 +78,8 @@ class DBRequestHandler(socketserver.BaseRequestHandler):
                         self._send_ok("Committed")
                     continue
                 if sql.upper().startswith("ROLLBACK"):
-                    rollback_table = self._get_table_for_rollback()
-                    if self._tx and tx_manager and rollback_table:
-                        rollback_table.rollback_transaction(self._tx)
+                    if self._tx and tx_manager:
+                        self._tx.rollback()
                         tx_manager.abort(self._tx)
                         self._tx = None
                         self._send_ok("Rolled back")

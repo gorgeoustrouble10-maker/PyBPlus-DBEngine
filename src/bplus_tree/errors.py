@@ -89,3 +89,10 @@ class UnsupportedSQLError(DBError):
 
     def __init__(self, hint: str = "") -> None:
         super().__init__(1109, f"Unsupported SQL: {hint}" if hint else "Unsupported SQL statement")
+
+
+class TableInUseError(DBError):
+    """1091 - Can't DROP table; file in use / 表无法删除，文件被占用"""
+
+    def __init__(self, table: str) -> None:
+        super().__init__(1091, f"Can't DROP table '{table}'; file in use")
