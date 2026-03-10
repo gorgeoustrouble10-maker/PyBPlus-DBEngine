@@ -8,6 +8,7 @@ Japanese: WAL マスタースレーブ複製；Master が Push、Slave が受信
 
 import base64
 import logging
+import select
 import socket
 import struct
 import threading
@@ -18,8 +19,9 @@ from typing import Any, Optional
 from bplus_tree.logging import WriteAheadLog
 
 REPL_HEADER_LEN: int = 4
-REPL_POLL_INTERVAL: float = 0.1
+REPL_POLL_INTERVAL: float = 0.05
 FAILOVER_NO_HEARTBEAT_SEC: float = 5.0
+REPLICATION_TIMEOUT_DEFAULT: float = 0.1
 
 
 def _apply_wal_line(
@@ -122,6 +124,8 @@ class ReplicationPublisher:
         self._slaves: list[socket.socket] = []
         self._slaves_lock = threading.Lock()
         self._positions: dict[str, int] = {}
+        self._last_acked: dict[str, int] = {}
+        self._ack_condition = threading.Condition(threading.Lock())
         self._stop = threading.Event()
         self._listener: Optional[socket.socket] = None
 
@@ -135,17 +139,24 @@ class ReplicationPublisher:
                     self._positions[p.name] = p.stat().st_size
         return result
 
-    def _read_new_lines(self, table_name: str, path: Path) -> list[str]:
+    def _read_new_lines(self, table_name: str, path: Path) -> list[tuple[str, int]]:
+        """Read new lines; return [(line, end_offset), ...] for semi-sync ACK."""
         pos = self._positions.get(path.name, 0)
+        result: list[tuple[str, int]] = []
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "rb") as f:
                 f.seek(pos)
-                lines = f.readlines()
-                new_pos = f.tell()
-                self._positions[path.name] = new_pos
-                return lines
+                while True:
+                    line_b = f.readline()
+                    if not line_b:
+                        break
+                    new_pos = f.tell()
+                    line = line_b.decode("utf-8", errors="replace")
+                    result.append((line, new_pos))
+                    self._positions[path.name] = new_pos
         except Exception:
-            return []
+            pass
+        return result
 
     def _run_acceptor(self) -> None:
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -171,8 +182,8 @@ class ReplicationPublisher:
                     logging.warning("Replication accept error")
                 break
 
-    def _broadcast(self, table_name: str, line: str) -> None:
-        msg = f"{table_name}\t{line}".encode("utf-8")
+    def _broadcast(self, table_name: str, line: str, offset: int) -> None:
+        msg = f"{table_name}\t{offset}\t{line}".encode("utf-8")
         payload = struct.pack("<I", len(msg)) + msg
         dead: list[socket.socket] = []
         with self._slaves_lock:
@@ -187,17 +198,80 @@ class ReplicationPublisher:
     def _run_tailer(self) -> None:
         while not self._stop.is_set():
             for table_name, path in self._get_wal_paths():
-                for line in self._read_new_lines(table_name, path):
+                for line, offset in self._read_new_lines(table_name, path):
                     if line.strip():
-                        self._broadcast(table_name, line)
+                        self._broadcast(table_name, line, offset)
             time.sleep(REPL_POLL_INTERVAL)
 
+    def _run_ack_receiver(self) -> None:
+        """Read ACKs from slave sockets; update last_acked and notify waiters."""
+        buffer_per_slave: dict[socket.socket, bytearray] = {}
+        while not self._stop.is_set():
+            with self._slaves_lock:
+                slaves = list(self._slaves)
+            if not slaves:
+                time.sleep(0.05)
+                continue
+            try:
+                rlist, _, _ = select.select(slaves, [], [], 0.2)
+            except (OSError, ValueError):
+                time.sleep(0.05)
+                continue
+            for s in rlist:
+                try:
+                    data = s.recv(4096)
+                    if not data:
+                        continue
+                    buf = buffer_per_slave.setdefault(s, bytearray())
+                    buf.extend(data)
+                    while b"\n" in buf:
+                        idx = buf.index(b"\n")
+                        line = bytes(buf[:idx]).decode("utf-8", errors="replace").strip()
+                        del buf[: idx + 1]
+                        if line.startswith("ACK\t"):
+                            parts = line.split("\t")
+                            if len(parts) >= 3:
+                                tbl, off_s = parts[1], parts[2]
+                                try:
+                                    off = int(off_s)
+                                    with self._ack_condition:
+                                        old = self._last_acked.get(tbl, 0)
+                                        self._last_acked[tbl] = max(old, off)
+                                        self._ack_condition.notify_all()
+                                except ValueError:
+                                    pass
+                except (ConnectionResetError, BrokenPipeError, OSError):
+                    buffer_per_slave.pop(s, None)
+
+    def wait_for_ack(
+        self,
+        table: str,
+        offset: int,
+        timeout: float = REPLICATION_TIMEOUT_DEFAULT,
+    ) -> bool:
+        """
+        Block until at least one Slave has acked offset, or timeout.
+        Returns True if acked, False if timeout (then degrade to async).
+        """
+        deadline = time.monotonic() + timeout
+        with self._ack_condition:
+            while time.monotonic() < deadline:
+                if self._last_acked.get(table, 0) >= offset:
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._ack_condition.wait(timeout=min(0.01, remaining))
+        return False
+
     def start(self) -> None:
-        """Start acceptor and tailer threads."""
+        """Start acceptor, tailer, and ack_receiver threads."""
         t_acceptor = threading.Thread(target=self._run_acceptor, daemon=True)
         t_acceptor.start()
         t_tailer = threading.Thread(target=self._run_tailer, daemon=True)
         t_tailer.start()
+        t_ack = threading.Thread(target=self._run_ack_receiver, daemon=True)
+        t_ack.start()
 
     def stop(self) -> None:
         """Stop and cleanup."""
@@ -297,11 +371,27 @@ class ReplicationSubscriber:
                         break
                     msg = data.decode("utf-8", errors="replace")
                     if "\t" in msg:
-                        table_name, line = msg.split("\t", 1)
-                        _apply_wal_line(self._tables, table_name, line, self._state)
-                        self._last_receive_time = time.monotonic()
-                        if self._replication_info_ref is not None:
-                            self._replication_info_ref["replication_lag"] = f"{self.replication_lag:.3f}s"
+                        parts = msg.split("\t", 2)
+                        if len(parts) >= 2:
+                            table_name = parts[0]
+                            wal_offset: Optional[int] = None
+                            if len(parts) == 3:
+                                try:
+                                    wal_offset = int(parts[1])
+                                    line = parts[2]
+                                except ValueError:
+                                    line = parts[1]
+                            else:
+                                line = parts[1]
+                            _apply_wal_line(self._tables, table_name, line, self._state)
+                            self._last_receive_time = time.monotonic()
+                            if self._replication_info_ref is not None:
+                                self._replication_info_ref["replication_lag"] = f"{self.replication_lag:.3f}s"
+                            if wal_offset is not None:
+                                try:
+                                    sock.sendall(f"ACK\t{table_name}\t{wal_offset}\n".encode("utf-8"))
+                                except Exception:
+                                    pass
             except Exception as e:
                 if not self._stop.is_set():
                     logging.warning("Replication subscriber error: %s", e)

@@ -6,6 +6,7 @@ Chinese: 极简 SQL 解析器与执行引擎；支持 ORDER BY、LIMIT、COUNT(*
 Japanese: ミニマル SQL パーサーと実行エンジン；ORDER BY、LIMIT、COUNT(*)、SHOW TABLES、SHOW STATS 対応。
 """
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,6 +90,17 @@ class ParsedShowHealth:
 
 
 @dataclass
+class ParsedSetGlobal:
+    """
+    English: Parsed SET GLOBAL var = value.
+    Chinese: 解析后的 SET GLOBAL var = value。
+    Japanese: パース済み SET GLOBAL var = value。
+    """
+    var: str
+    value: str
+
+
+@dataclass
 class ParsedInsert:
     """
     English: Parsed INSERT statement.
@@ -147,7 +159,7 @@ class ParsedExplain:
 
 def parse_sql(
     sql: str,
-) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSavepoint | ParsedRollbackTo | ParsedExplain:
+) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSetGlobal | ParsedSavepoint | ParsedRollbackTo | ParsedExplain:
     """
     English: Parse SQL string; malformed SQL returns 1064 Syntax Error, never crashes.
     Chinese: 解析 SQL；畸形 SQL 返回 1064 语法错误，不会导致进程崩溃。
@@ -163,7 +175,7 @@ def parse_sql(
 
 def _parse_sql_impl(
     sql: str,
-) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSavepoint | ParsedRollbackTo | ParsedExplain:
+) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats | ParsedShowHealth | ParsedSetGlobal | ParsedSavepoint | ParsedRollbackTo | ParsedExplain:
     """Internal parse; exceptions converted by parse_sql."""
     sql = sql.strip().rstrip(";").strip()
     if not sql:
@@ -191,6 +203,8 @@ def _parse_sql_impl(
         return ParsedShowStats()
     if upper.startswith("SHOW HEALTH"):
         return ParsedShowHealth()
+    if upper.startswith("SET GLOBAL"):
+        return _parse_set_global(sql)
     if upper.startswith("SELECT"):
         return _parse_select(sql)
     if upper.startswith("INSERT"):
@@ -388,6 +402,24 @@ def _parse_value(s: str) -> Any:
         return int(s)
     except ValueError:
         return s
+
+
+def _parse_set_global(sql: str) -> ParsedSetGlobal:
+    """Parse SET GLOBAL var = 'value' or SET GLOBAL var = value."""
+    m = re.match(
+        r"SET\s+GLOBAL\s+(\w+)\s*=\s*(.+)\s*$",
+        sql.strip(),
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        raise SQLSyntaxError("Invalid SET GLOBAL syntax; use: SET GLOBAL var = 'value'")
+    var = m.group(1).strip()
+    raw = m.group(2).strip()
+    if (raw.startswith("'") and raw.endswith("'")) or (
+        raw.startswith('"') and raw.endswith('"')
+    ):
+        raw = raw[1:-1]
+    return ParsedSetGlobal(var=var, value=raw)
 
 
 def _parse_insert(sql: str) -> ParsedInsert:
@@ -626,6 +658,8 @@ def execute_sql(
     tx: Optional[Any] = None,
     tx_manager: Optional[Any] = None,
     replication_info: Optional[dict[str, Any]] = None,
+    replication_publisher: Optional[Any] = None,
+    replication_timeout: float = 0.1,
 ) -> tuple[str, list[list[Any]], Optional[list[str]]]:
     """
     English: Execute SQL; use db for multi-table/CREATE, tx_manager for SHOW STATS.
@@ -672,6 +706,19 @@ def execute_sql(
 
     if isinstance(parsed, ParsedShowHealth):
         return ("OK", [["status", "OK"]], ["metric", "value"])
+
+    if isinstance(parsed, ParsedSetGlobal):
+        if replication_info is None:
+            raise UnsupportedSQLError("SET GLOBAL requires replication_info (server mode)")
+        if parsed.var.lower() == "replication_type":
+            v = parsed.value.upper()
+            if v in ("SEMI_SYNC", "ASYNC"):
+                replication_info["replication_type"] = v
+                return (f"SET GLOBAL {parsed.var} = {v}", [], None)
+            raise SQLSyntaxError(
+                f"replication_type must be 'SEMI_SYNC' or 'ASYNC', got '{parsed.value}'"
+            )
+        raise SQLSyntaxError(f"Unknown global variable: {parsed.var}")
 
     if isinstance(parsed, ParsedSelect):
         tbl = _get_table(parsed.table)
@@ -743,6 +790,28 @@ def execute_sql(
                 f"INSERT data size ({size} bytes) exceeds limit ({MAX_INSERT_BYTES})"
             )
         tbl.insert_row(values, transaction=tx)
+        if (
+            db is not None
+            and replication_publisher is not None
+            and replication_info is not None
+            and replication_info.get("replication_type") == "SEMI_SYNC"
+        ):
+            wal_path = getattr(db, "_data_dir", None)
+            if wal_path is not None:
+                wal_file = Path(wal_path) / f"wal_{parsed.table}.log"
+                offset = wal_file.stat().st_size if wal_file.exists() else 0
+                acked = replication_publisher.wait_for_ack(
+                    parsed.table, offset, replication_timeout
+                )
+                if not acked:
+                    logging.warning(
+                        "Semi-sync ACK timeout (%.0fms) for table %s offset %d; "
+                        "degrading to async replication.",
+                        replication_timeout * 1000,
+                        parsed.table,
+                        offset,
+                    )
+                    replication_info["replication_type"] = "ASYNC"
         return ("INSERT ok", [], None)
 
     if isinstance(parsed, ParsedDelete):

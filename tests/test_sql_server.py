@@ -418,6 +418,108 @@ class TestBufferPoolPersistence:
             assert ids == [1, 2]
 
 
+class TestSemiSyncConsistency:
+    """Phase 26a: 半同步复制 - Slave ACK、Master 等待、超时降级。"""
+
+    def test_semi_sync_consistency(self) -> None:
+        """Semi-sync 模式：Master 等待 Slave ACK 后才返回；Slave 无连接时超时降级。"""
+        import shutil
+        import tempfile
+        import time
+        from pathlib import Path
+
+        from bplus_tree.database_context import DatabaseContext
+        from bplus_tree.replication import ReplicationPublisher, ReplicationSubscriber
+
+        d = tempfile.mkdtemp()
+        publisher = None
+        subscriber = None
+        try:
+            path = Path(d)
+            ctx = DatabaseContext(path)
+            ctx.create_table("t", Schema(fields=[("id", "INT"), ("v", "VARCHAR(8)")]), "id")
+
+            repl_port = 18770
+            replication_info: dict[str, Any] = {
+                "node_role": "MASTER",
+                "replication_type": "SEMI_SYNC",
+            }
+            publisher = ReplicationPublisher(ctx._data_dir, ctx.get_tables(), repl_port)
+            publisher.start()
+
+            from bplus_tree.sql_engine import execute_sql
+
+            # 无 Slave：INSERT 应超时并降级为 ASYNC
+            execute_sql(
+                "INSERT INTO t (id, v) VALUES (1, 'a')",
+                db=ctx,
+                replication_info=replication_info,
+                replication_publisher=publisher,
+                replication_timeout=0.05,
+            )
+            assert replication_info.get("replication_type") == "ASYNC"
+
+            # 重置为 SEMI_SYNC 并启动 Slave
+            replication_info["replication_type"] = "SEMI_SYNC"
+            tables = ctx.get_tables()
+            subscriber = ReplicationSubscriber(
+                "127.0.0.1",
+                repl_port,
+                tables,
+                replication_info_ref={"node_role": "SLAVE"},
+                failover_timeout_sec=10.0,
+            )
+            subscriber.start()
+            time.sleep(0.3)
+
+            # 有 Slave：INSERT 应成功，Slave 收到并 ACK
+            execute_sql(
+                "INSERT INTO t (id, v) VALUES (2, 'b')",
+                db=ctx,
+                replication_info=replication_info,
+                replication_publisher=publisher,
+                replication_timeout=0.2,
+            )
+            assert replication_info.get("replication_type") == "SEMI_SYNC"
+
+            time.sleep(0.2)
+            slave_t = tables["t"]
+            rows = list(slave_t.scan_with_condition(lambda _: True))
+            ids = sorted(r.get_field("id") for r in rows)
+            assert 2 in ids
+        finally:
+            if subscriber:
+                subscriber.stop()
+            if publisher:
+                publisher.stop()
+            time.sleep(0.2)
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class TestSetGlobal:
+    """Phase 26a: SET GLOBAL replication_type。"""
+
+    def test_set_global_replication_type(self) -> None:
+        from bplus_tree.sql_engine import parse_sql, execute_sql
+
+        p = parse_sql("SET GLOBAL replication_type = 'SEMI_SYNC'")
+        assert p.var == "replication_type"
+        assert p.value == "SEMI_SYNC"
+
+        repl_info: dict[str, Any] = {"replication_type": "ASYNC"}
+        msg, _, _ = execute_sql(
+            "SET GLOBAL replication_type = 'SEMI_SYNC'",
+            replication_info=repl_info,
+        )
+        assert repl_info["replication_type"] == "SEMI_SYNC"
+
+        msg, _, _ = execute_sql(
+            "SET GLOBAL replication_type = 'ASYNC'",
+            replication_info=repl_info,
+        )
+        assert repl_info["replication_type"] == "ASYNC"
+
+
 class TestWireProtocol:
     """Wire Protocol 编码测试。"""
 

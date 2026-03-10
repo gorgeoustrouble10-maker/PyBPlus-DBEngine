@@ -4,9 +4,9 @@
 
 ---
 
-**Version**: 2.1  
+**Version**: 2.2  
 **Date**: 2026  
-**Status**: Phase 1–Phase 25 (Cost Estimation, Auto-Failover)
+**Status**: Phase 1–Phase 26a (Semi-Sync Replication, ACK Logic)
 
 ---
 
@@ -29,6 +29,7 @@
 15. [Phase 21-22: Unified Persistence & Full MVCC | Phase 21-22：统一持久化与完整 MVCC](#15-phase-21-22-unified-persistence--full-mvcc)
 16. [Phase 24: Query Profiling & WAL Replication | Phase 24：执行计划分析与主从同步](#16-phase-24-query-profiling--wal-replication)
 17. [Phase 25: Cost Estimation & Auto-Failover | Phase 25：代价模型与自动故障转移](#17-phase-25-cost-estimation--auto-failover)
+18. [Phase 26a: Semi-Sync Replication | Phase 26a：半同步复制与一致性增强](#18-phase-26a-semi-sync-replication)
 
 ---
 
@@ -685,7 +686,7 @@ flowchart TB
 | **Master** | `--replication-port 8767` | 在端口 8767 接受 Slave 连接，推送 WAL 流 |
 | **Slave** | `--slave-of 127.0.0.1:8767` | 连接 Master，接收 WAL 并实时重放 |
 
-**数据流**：Master 的 WAL 尾读线程定期轮询 `wal_*.log`，将新增记录以 `table\tline` 格式推送给已连接的 Slave。Slave 解析并调用 `_apply_wal_line` 重放。
+**数据流**：Master 的 WAL 尾读线程定期轮询 `wal_*.log`，将新增记录以 `table\toffset\tline` 格式（Phase 26a：offset 为字节偏移）推送给已连接的 Slave。Slave 解析、重放后回发 `ACK\t{table}\t{offset}`；半同步模式下 Master 等待 ACK 后再向客户端返回成功。
 
 ### 16.3 运维指标增强 | Operations Metrics | オペレーションメトリクス
 
@@ -739,6 +740,80 @@ Cost_IndexScan = estimated_range_rows × 0.5 + 10   (10 为索引寻道常数)
 
 ---
 
+## 18. Phase 26a: Semi-Sync Replication
+## Phase 26a：半同步复制与写一致性增强
+## Phase 26a：セミ同期レプリケーションと書き込み一貫性強化
+
+### 18.1 半同步协议时序图 | Semi-Sync Protocol Sequence Diagram
+### 半同期プロトコルシーケンス図
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Master
+    participant WAL
+    participant Publisher
+    participant Slave
+
+    Client->>Master: INSERT
+    Master->>WAL: log_insert
+    Master->>Publisher: tail & broadcast(table, offset, line)
+    Publisher->>Slave: table\toffset\tline
+
+    Slave->>Slave: _apply_wal_line
+    Slave->>Publisher: ACK\ttable\toffset
+
+    Publisher->>Publisher: last_acked[table] = max(..., offset)
+    Publisher->>Publisher: condition.notify_all
+
+    Master->>Master: wait_for_ack(table, offset, timeout)
+    alt ACK received
+        Master->>Client: INSERT ok
+    else Timeout
+        Master->>Master: degrade to ASYNC, log warning
+        Master->>Client: INSERT ok
+    end
+```
+
+**说明**：Master 在返回客户端成功前，若启用半同步模式，则需在 Condition Variable 上阻塞，直至收到至少一个 Slave 对当前 WAL 偏移量的 ACK；超时（默认 100ms）则自动降级为异步并记录告警。
+
+### 18.2 Slave ACK 机制 | Slave ACK Mechanism | スレーブ ACK メカニズム
+
+| 组件 | 行为 |
+|------|------|
+| **ReplicationSubscriber** | 成功重放一条 WAL 后，立即向 Master 发送 `ACK\t{table}\t{offset}\n` |
+| **消息格式** | 从 `table\tline` 升级为 `table\toffset\tline`，offset 为 WAL 文件字节位置 |
+| **ReplicationPublisher** | 独立 `_ack_receiver` 线程，使用 `select` 从 Slave 连接读取 ACK，更新 `last_acked[table]` |
+
+### 18.3 Master 等待逻辑 | Master WAIT_FOR_SLAVE Logic | マスター待機ロジック
+
+| 配置 | 值 | 说明 |
+|------|-----|------|
+| **replication_timeout** | 100ms（默认） | 等待 ACK 超时时间 |
+| **超时处理** | 自动降级 | 超时后设置 `replication_type = 'ASYNC'`，记录 `logging.warning` |
+| **调用点** | `execute_sql` INSERT 分支 | 在 `tbl.insert_row` 成功后，若 `replication_type == 'SEMI_SYNC'` 则调用 `wait_for_ack` |
+
+### 18.4 一致性折中方案 | Consistency Trade-off | 一貫性トレードオフ
+
+| 模式 | 延迟 | 一致性 | 适用场景 |
+|------|------|--------|----------|
+| **ASYNC** | 低 | 最终一致 | 高吞吐、可容忍短暂主从落后 |
+| **SEMI_SYNC** | 中等（+ 网络 RTT） | 至少一从已持久 | 强一致读从库、故障切换零丢失 |
+
+**折中要点**：
+- 半同步保证：客户端收到成功时，至少一个 Slave 已重放该 WAL 偏移量；主库宕机时，提升该从库可避免数据丢失。
+- 代价：写延迟增加约 1 RTT；无 Slave 连接时超时降级，避免无限阻塞。
+- SQL 切换：`SET GLOBAL replication_type = 'SEMI_SYNC' | 'ASYNC'` 支持运行时切换。
+
+### 18.5 SQL 语法支持 | SQL Syntax Support | SQL 構文サポート
+
+```
+SET GLOBAL replication_type = 'SEMI_SYNC'
+SET GLOBAL replication_type = 'ASYNC'
+```
+
+---
+
 ## References
 ## 参考文献
 ## 参考文献
@@ -749,9 +824,9 @@ Cost_IndexScan = estimated_range_rows × 0.5 + 10   (10 为索引寻道常数)
 
 ---
 
-*Document generated from Phase 1–Phase 25 implementation.  
-本白皮书基于 Phase 1 至 Phase 25 的完整实现生成。  
-Phase 1〜Phase 25 の実装に基づいて本ホワイトペーパーを生成しました。*
+*Document generated from Phase 1–Phase 26a implementation.  
+本白皮书基于 Phase 1 至 Phase 26a 的完整实现生成。  
+Phase 1〜Phase 26a の実装に基づいて本ホワイトペーパーを生成しました。*
 
 ---
 
