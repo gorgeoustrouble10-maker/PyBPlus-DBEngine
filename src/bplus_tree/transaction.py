@@ -67,6 +67,7 @@ class Transaction:
         self._state: TxState = TxState.ACTIVE
         self._undo_records: list[UndoRecord] = []
         self._involved_tables: set[Any] = set()
+        self._savepoints: dict[str, int] = {}
 
     def register_table(self, table: Any) -> None:
         """
@@ -139,6 +140,43 @@ class Transaction:
             raise RuntimeError(f"Cannot abort transaction in state {self._state}")
         self._state = TxState.ABORTED
 
+    def savepoint(self, name: str) -> None:
+        """
+        English: Create savepoint; snapshot current undo_records length for rollback_to.
+        Chinese: 创建保存点；记录当前 undo_records 长度，供 rollback_to 使用。
+        Japanese: セーブポイントを作成；rollback_to 用に undo_records 長を記録。
+        """
+        if self._state != TxState.ACTIVE:
+            raise RuntimeError(f"Cannot create savepoint in state {self._state}")
+        self._savepoints[name] = len(self._undo_records)
+
+    def rollback_to(self, name: str, tree: Any = None) -> None:
+        """
+        English: Rollback to savepoint; undo from current to snapshot, truncate undo_records.
+        Chinese: 回滚到保存点；逆序执行从当前到快照之间的 Undo，截断 undo_records。
+        Japanese: セーブポイントへロールバック；現在からスナップショットまでの Undo を逆順適用、 truncate。
+        """
+        if self._state != TxState.ACTIVE:
+            raise RuntimeError(f"Cannot rollback to savepoint in state {self._state}")
+        if name not in self._savepoints:
+            raise ValueError(f"Savepoint '{name}' does not exist")
+        target_len = self._savepoints[name]
+        to_undo = self._undo_records[target_len:]
+        for rec in reversed(to_undo):
+            t = rec.table if rec.table is not None else tree
+            if t is None:
+                continue
+            target = getattr(t, "_tree", t)
+            if rec.op == "INSERT":
+                try:
+                    target.delete(rec.key)
+                except KeyError:
+                    pass
+            elif rec.op == "DELETE" and rec.before_image is not None:
+                target.insert(rec.key, rec.before_image)
+        self._undo_records = self._undo_records[:target_len]
+        self._savepoints = {k: v for k, v in self._savepoints.items() if v < target_len}
+
     def rollback(self, tree: Any = None) -> None:
         """
         English: Physical rollback: apply undo records in reverse (LIFO), restore page data.
@@ -161,6 +199,7 @@ class Transaction:
             elif rec.op == "DELETE" and rec.before_image is not None:
                 target.insert(rec.key, rec.before_image)
         self._undo_records = []
+        self._savepoints = {}
         self._state = TxState.ABORTED
 
 

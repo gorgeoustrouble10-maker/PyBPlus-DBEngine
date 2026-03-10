@@ -107,6 +107,26 @@ class ParsedDelete:
     pk_value: Optional[Any] = None  # 若 WHERE id = N 则提取出 N
 
 
+@dataclass
+class ParsedSavepoint:
+    """
+    English: Parsed SAVEPOINT name statement.
+    Chinese: 解析后的 SAVEPOINT name 语句。
+    Japanese: パース済み SAVEPOINT name 文。
+    """
+    name: str
+
+
+@dataclass
+class ParsedRollbackTo:
+    """
+    English: Parsed ROLLBACK TO name statement.
+    Chinese: 解析后的 ROLLBACK TO name 语句。
+    Japanese: パース済み ROLLBACK TO name 文。
+    """
+    name: str
+
+
 def parse_sql(
     sql: str,
 ) -> ParsedSelect | ParsedInsert | ParsedDelete | ParsedCreateTable | ParsedDropTable | ParsedShowTables | ParsedShowStats:
@@ -144,6 +164,10 @@ def _parse_sql_impl(sql: str):
         return _parse_insert(sql)
     if upper.startswith("DELETE"):
         return _parse_delete(sql)
+    if upper.startswith("SAVEPOINT"):
+        return _parse_savepoint(sql)
+    if upper.startswith("ROLLBACK TO"):
+        return _parse_rollback_to(sql)
 
     raise SQLSyntaxError(f"Unsupported SQL: {sql[:50]}...")
 
@@ -366,6 +390,30 @@ def _parse_value_list(s: str) -> list[Any]:
             tok = s[start:i].strip()
             result.append(_parse_value(tok))
     return result
+
+
+def _parse_savepoint(sql: str) -> ParsedSavepoint:
+    """
+    English: Parse SAVEPOINT name.
+    Chinese: 解析 SAVEPOINT name。
+    Japanese: SAVEPOINT name をパース。
+    """
+    m = re.match(r"SAVEPOINT\s+(\w+)", sql, re.IGNORECASE)
+    if not m:
+        raise SQLSyntaxError("Invalid SAVEPOINT syntax")
+    return ParsedSavepoint(name=m.group(1).strip())
+
+
+def _parse_rollback_to(sql: str) -> ParsedRollbackTo:
+    """
+    English: Parse ROLLBACK TO name.
+    Chinese: 解析 ROLLBACK TO name。
+    Japanese: ROLLBACK TO name をパース。
+    """
+    m = re.match(r"ROLLBACK\s+TO\s+(\w+)", sql, re.IGNORECASE)
+    if not m:
+        raise SQLSyntaxError("Invalid ROLLBACK TO syntax")
+    return ParsedRollbackTo(name=m.group(1).strip())
 
 
 def _parse_delete(sql: str) -> ParsedDelete:

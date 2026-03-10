@@ -4,9 +4,9 @@
 
 ---
 
-**Version**: 1.6  
+**Version**: 1.7  
 **Date**: 2026  
-**Status**: Phase 1–Phase 18 (Query Enhancement & Observability)
+**Status**: Phase 1–Phase 19 (Concurrency, Stress & Savepoints)
 
 ---
 
@@ -25,6 +25,7 @@
 11. [Phase 16: Recovery & DDL | Phase 16：恢复与数据定义语言](#11-phase-16-recovery--ddl)
 12. [Phase 17: System Integrity Closure | Phase 17：系统完整性合拢](#12-phase-17-system-integrity-closure)
 13. [Phase 18: Query Enhancement & Observability | Phase 18：查询优化与可观测性](#13-phase-18-query-enhancement--observability)
+14. [Phase 19: Concurrency, Stress & Savepoints | Phase 19：并发、压力测试与保存点](#14-phase-19-concurrency-stress--savepoints)
 
 ---
 
@@ -562,19 +563,43 @@ Client                    Server                     RowTable
 
 ---
 
+## 14. Phase 19: Concurrency, Stress & Savepoints
+## Phase 19：并发、压力测试与保存点
+## Phase 19：並行性、ストレステストとセーブポイント
+
+### 14.1 Savepoints | 事务保存点 | トランザクションセーブポイント
+
+- **数据结构**：`Transaction._savepoints: dict[str, int]`，Key 为名称，Value 为 `undo_records` 长度快照。
+- **SAVEPOINT name**：记录当前 `len(_undo_records)`。
+- **ROLLBACK TO name**：逆序执行从当前到 `_savepoints[name]` 之间的 Undo，截断 `_undo_records`，删除该保存点及之后创建的保存点。
+
+### 14.2 Server Robustness | 连接超时与清理 | 接続タイムアウトとクリーンアップ
+
+- **Timeout**：`socket.settimeout(60.0)`，客户端 60 秒无响应则 `recv` 抛出 `socket.timeout`。
+- **Cleanup**：捕获 `socket.timeout` 后，若有未提交事务则强制 `rollback()` 并断开连接。
+
+### 14.3 Concurrency Benchmark | 并发压力测试 | 並行ストレステスト
+
+- **脚本**：`scripts/benchmark_concurrency.py`
+- **配置**：20 客户端、30 秒、随机 INSERT / SELECT COUNT(*)
+- **用法**：先启动 `run_server_with_recovery -d ./data`，再运行 `python benchmark_concurrency.py`
+- **验证**：无死锁、无数据损坏；COUNT(*) 符合 Read Committed 一致性。
+
+---
+
 ## References
 ## 参考文献
 ## 参考文献
 
 - PyBPlus-DBEngine 源码：`src/bplus_tree/`
-- 基准脚本：`scripts/benchmark.py`
+- 基准脚本：`scripts/benchmark.py`、`scripts/benchmark_concurrency.py`
 - 测试：`tests/test_*.py`
 
 ---
 
-*Document generated from Phase 1–Phase 18 implementation.  
-本白皮书基于 Phase 1 至 Phase 18 的完整实现生成。  
-Phase 1〜Phase 18 の実装に基づいて本ホワイトペーパーを生成しました。*
+*Document generated from Phase 1–Phase 19 implementation.  
+本白皮书基于 Phase 1 至 Phase 19 的完整实现生成。  
+Phase 1〜Phase 19 の実装に基づいて本ホワイトペーパーを生成しました。*
 
 ---
 

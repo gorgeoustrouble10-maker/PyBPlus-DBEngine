@@ -1,20 +1,24 @@
 """
-多线程 TCP 数据库服务器；Wire Protocol [Length][Payload]。
+多线程 TCP 数据库服务器；Wire Protocol [Length][Payload]；连接超时与清理。
 
-English: Multi-threaded TCP database server; Wire Protocol [Length][Payload].
-Chinese: 多线程 TCP 数据库服务器；Wire Protocol [Length][Payload]。
-Japanese: マルチスレッド TCP データベースサーバー；Wire Protocol [Length][Payload]。
+English: Multi-threaded TCP database server; Wire Protocol [Length][Payload]; timeout & cleanup.
+Chinese: 多线程 TCP 数据库服务器；Wire Protocol；连接超时与资源清理。
+Japanese: マルチスレッド TCP データベースサーバー；Wire Protocol；接続タイムアウトとリソース解放。
 """
 
+import socket
 import struct
 import socketserver
 from pathlib import Path
 from typing import Any, Optional
 
+# 客户端空闲超时（秒）；超时后强制回滚未提交事务并断开
+CLIENT_IDLE_TIMEOUT: float = 60.0
+
 from bplus_tree.errors import DBError
 from bplus_tree.table import RowTable
 from bplus_tree.transaction import TransactionManager
-from bplus_tree.sql_engine import execute_sql
+from bplus_tree.sql_engine import execute_sql, parse_sql
 
 # Wire Protocol: [4 bytes length LE][payload UTF-8]
 MSG_HEADER_LEN: int = 4
@@ -44,10 +48,17 @@ class DBRequestHandler(socketserver.BaseRequestHandler):
     """
 
     def setup(self) -> None:
+        """
+        English: Set socket timeout; 60s idle forces rollback and disconnect.
+        Chinese: 设置 socket 超时；60 秒无响应则强制回滚并断开。
+        Japanese: ソケットタイムアウトを設定；60秒無応答で強制ロールバックと切断。
+        """
         self._tx: Optional[Any] = None
         self._tx_manager = getattr(self.server, "tx_manager", None)
         self._table = getattr(self.server, "table", None)
         self._db = getattr(self.server, "db", None)
+        if hasattr(self.request, "settimeout"):
+            self.request.settimeout(CLIENT_IDLE_TIMEOUT)
 
     def handle(self) -> None:
         db = self._db
@@ -77,12 +88,41 @@ class DBRequestHandler(socketserver.BaseRequestHandler):
                         self._tx = None
                         self._send_ok("Committed")
                     continue
+                if sql.upper().startswith("ROLLBACK TO"):
+                    if self._tx and tx_manager:
+                        try:
+                            parsed = parse_sql(sql)
+                            if hasattr(parsed, "name"):
+                                self._tx.rollback_to(parsed.name)
+                                self._send_ok(f"Rolled back to {parsed.name}")
+                            else:
+                                self._tx.rollback()
+                                tx_manager.abort(self._tx)
+                                self._tx = None
+                                self._send_ok("Rolled back")
+                        except (ValueError, Exception) as e:
+                            self._send_error(f"[1064] {e}")
+                    continue
                 if sql.upper().startswith("ROLLBACK"):
                     if self._tx and tx_manager:
                         self._tx.rollback()
                         tx_manager.abort(self._tx)
                         self._tx = None
                         self._send_ok("Rolled back")
+                    continue
+                if sql.upper().startswith("SAVEPOINT"):
+                    if self._tx and tx_manager:
+                        try:
+                            parsed = parse_sql(sql)
+                            if hasattr(parsed, "name"):
+                                self._tx.savepoint(parsed.name)
+                                self._send_ok(f"Savepoint {parsed.name} created")
+                            else:
+                                self._send_error("[1064] Invalid SAVEPOINT")
+                        except (ValueError, Exception) as e:
+                            self._send_error(f"[1064] {e}")
+                    else:
+                        self._send_error("[1064] No active transaction for SAVEPOINT")
                     continue
 
                 if db is not None:
@@ -93,6 +133,15 @@ class DBRequestHandler(socketserver.BaseRequestHandler):
                     msg, rows, columns = execute_sql(sql, table=table, tx=self._tx)
                 payload = _encode_response_correct("OK", msg, rows, columns)
                 self._send_raw(payload)
+            except socket.timeout:
+                if self._tx and tx_manager:
+                    try:
+                        self._tx.rollback()
+                        tx_manager.abort(self._tx)
+                    except Exception:
+                        pass
+                    self._tx = None
+                break
             except DBError as e:
                 self._send_error(e.format_for_wire())
             except Exception as e:

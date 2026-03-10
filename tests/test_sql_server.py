@@ -264,6 +264,43 @@ class TestPhase18:
             parse_sql("CREATE TABLE t (id INT, x VARCHAR(99999))")
 
 
+class TestPhase19Savepoints:
+    """Phase 19: 事务保存点 SAVEPOINT / ROLLBACK TO。"""
+
+    def test_savepoint_rollback_to(self) -> None:
+        """SAVEPOINT 创建后，ROLLBACK TO 仅回滚之后的操作。"""
+        from bplus_tree.schema import Schema
+        from bplus_tree.table import RowTable
+        from bplus_tree.transaction import Transaction, TransactionManager
+
+        schema = Schema(fields=[("id", "INT"), ("v", "VARCHAR(8)")])
+        table = RowTable(schema, primary_key="id")
+        tx_mgr = TransactionManager()
+        tx = tx_mgr.begin()
+
+        table.insert_row([1, "a"], transaction=tx)
+        tx.savepoint("sp1")
+        table.insert_row([2, "b"], transaction=tx)
+        table.insert_row([3, "c"], transaction=tx)
+        tx.rollback_to("sp1")
+
+        rows = list(table.scan_with_condition(lambda _: True))
+        assert len(rows) == 1
+        assert rows[0].get_field("id") == 1
+
+        tx.rollback()
+        tx_mgr.abort(tx)
+
+    def test_parse_savepoint_rollback_to(self) -> None:
+        from bplus_tree.sql_engine import parse_sql
+
+        sp = parse_sql("SAVEPOINT my_sp")
+        assert hasattr(sp, "name") and sp.name == "my_sp"
+
+        rb = parse_sql("ROLLBACK TO my_sp")
+        assert hasattr(rb, "name") and rb.name == "my_sp"
+
+
 class TestWireProtocol:
     """Wire Protocol 编码测试。"""
 
