@@ -8,6 +8,7 @@ Japanese: 並行ストレステスト；20 クライアント、30 秒、高頻�
 """
 
 import argparse
+import logging
 import random
 import struct
 import sys
@@ -148,14 +149,14 @@ def run_benchmark(
     for t in threads:
         t.join(timeout=5.0)
 
-    print(f"Inserts: {inserts_done[0]}")
-    print(f"Selects: {selects_done[0]}")
+    logging.info("Inserts: %d", inserts_done[0])
+    logging.info("Selects: %d", selects_done[0])
     if errors:
-        print(f"Errors: {len(errors)}")
+        logging.error("Errors: %d", len(errors))
         for e in errors[:10]:
-            print(f"  - {e}")
+            logging.error("  - %s", e)
     else:
-        print("No deadlocks or exceptions.")
+        logging.info("No deadlocks or exceptions.")
 
 
 def setup_table(host: str, port: int) -> bool:
@@ -171,7 +172,7 @@ def setup_table(host: str, port: int) -> bool:
         sock.settimeout(5.0)
         sock.connect((host, port))
     except Exception as e:
-        print(f"Connect failed: {e}", file=sys.stderr)
+        logging.error("Connect failed: %s", e)
         return False
 
     for sql in ["CREATE TABLE stress (id INT, v VARCHAR(32))", "SHOW TABLES"]:
@@ -179,7 +180,7 @@ def setup_table(host: str, port: int) -> bool:
         if status == "ERROR":
             if "already exists" in resp:
                 break
-            print(f"Setup error: {resp}", file=sys.stderr)
+            logging.error("Setup error: %s", resp)
             sock.close()
             return False
     sock.close()
@@ -187,6 +188,7 @@ def setup_table(host: str, port: int) -> bool:
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description="PyBPlus-DB concurrency stress test")
     parser.add_argument("-H", "--host", default=DEFAULT_HOST, help="Server host")
     parser.add_argument("-P", "--port", type=int, default=DEFAULT_PORT, help="Server port")
@@ -196,19 +198,19 @@ def main() -> None:
     args = parser.parse_args()
 
     if not args.no_setup:
-        print("Setting up table...")
+        logging.info("Setting up table...")
         if not setup_table(args.host, args.port):
             sys.exit(1)
-        print("Table ready.")
+        logging.info("Table ready.")
 
-    print(f"Starting {args.workers} workers for {args.duration}s...")
+    logging.info("Starting %d workers for %.1fs...", args.workers, args.duration)
     run_benchmark(
         host=args.host,
         port=args.port,
         workers=args.workers,
         duration=args.duration,
     )
-    print("Done.")
+    logging.info("Done.")
 
 
 if __name__ == "__main__":

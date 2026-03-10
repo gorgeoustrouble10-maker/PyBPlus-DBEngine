@@ -1,0 +1,17 @@
+{
+  "tables": {
+    "stress": {
+      "fields": [
+        [
+          "id",
+          "INT"
+        ],
+        [
+          "v",
+          "VARCHAR(32)"
+        ]
+      ],
+      "primary_key": "id"
+    }
+  }
+}

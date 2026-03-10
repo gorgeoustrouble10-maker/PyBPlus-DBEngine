@@ -1,5 +1,6 @@
-# PyBPlus-DBEngine - B+ 树数据库索引引擎
-# Python 3.11+
+# PyBPlus-DBEngine
+# Runtime: standard library only (no external deps for running the engine)
+# For development & testing:
 
 pytest>=8.0.0
 black>=24.0.0

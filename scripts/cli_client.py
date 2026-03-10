@@ -8,6 +8,7 @@ Japanese: 対話型 SQL クライアント；PyBPlus-DB サーバーに接続し
 """
 
 import argparse
+import logging
 import struct
 import sys
 from pathlib import Path
@@ -65,14 +66,15 @@ def run_client(host: str, port: int) -> None:
     import socket
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(message)s")
     try:
         sock.connect((host, port))
     except OSError as e:
-        print(f"Connection failed: {e}", file=sys.stderr)
+        logging.error("Connection failed: %s", e)
         sys.exit(1)
 
-    print("PyBPlus-DB CLI (type QUIT to exit)")
-    print("-" * 40)
+    logging.info("PyBPlus-DB CLI (type QUIT to exit)")
+    logging.info("-" * 40)
 
     buffer = ""
     while True:
@@ -94,24 +96,24 @@ def run_client(host: str, port: int) -> None:
                 continue
             resp = send_query(sock, sql)
             if not resp:
-                print("(connection closed)")
+                logging.info("(connection closed)")
                 break
             parts = resp.split("\n")
             if len(parts) < 2:
-                print(resp)
+                logging.info("%s", resp)
                 continue
             status, message = parts[0], parts[1]
             if status == "ERROR":
-                print(f"Error: {message}")
+                logging.info("Error: %s", message)
                 continue
             if status == "OK":
                 if len(parts) > 2:
                     table_lines = parts[2:]
                     if table_lines:
-                        print(_format_table(table_lines))
-                print(f"\n{message}")
+                        logging.info("%s", _format_table(table_lines))
+                logging.info("\n%s", message)
     sock.close()
-    print("Bye.")
+    logging.info("Bye.")
 
 
 def main() -> None:

@@ -7,6 +7,7 @@ Chinese: 性能压测：对比 BPlusTree 与 dict。
 Japanese: パフォーマンスベンチマーク：BPlusTree と dict の比較。
 """
 
+import logging
 import random
 import sys
 import time
@@ -69,9 +70,11 @@ def bench_dict_range_scan(d: dict[int, str], start_key: int, end_key: int) -> fl
 
 
 def main() -> None:
-    print("=" * 60)
-    print("PyBPlus-DBEngine 性能压测 / Performance Benchmark")
-    print("=" * 60)
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(message)s")
+    log = logging.info
+    log("=" * 60)
+    log("PyBPlus-DBEngine 性能压测 / Performance Benchmark")
+    log("=" * 60)
 
     # 1. 生成随机 key 序列
     random.seed(42)
@@ -79,11 +82,11 @@ def main() -> None:
     random.shuffle(keys)
 
     # 2. 随机插入 10 万条
-    print("\n[1] 随机插入 (Random Insert) 100,000 条")
+    log("\n[1] 随机插入 (Random Insert) 100,000 条")
     t_bp_insert = bench_bplustree_insert(keys)
     t_dict_insert = bench_dict_insert(keys)
-    print(f"    BPlusTree: {_format_time(t_bp_insert)}")
-    print(f"    dict:     {_format_time(t_dict_insert)}")
+    log("    BPlusTree: %s", _format_time(t_bp_insert))
+    log("    dict:     %s", _format_time(t_dict_insert))
 
     # 3. 重建结构供范围查询
     tree = BPlusTree(order=64)
@@ -108,9 +111,9 @@ def main() -> None:
     d_ins = _cell(_format_time(t_dict_insert))
     bp_rng = _cell(_format_time(t_bp_range))
     d_rng = _cell(_format_time(t_dict_range))
-    print("\n" + "=" * 60)
-    print("对比结果 (Comparison Results)")
-    print("=" * 60)
+    log("\n" + "=" * 60)
+    log("对比结果 (Comparison Results)")
+    log("=" * 60)
     tbl = f"""
 +------------------+------------------+------------------+
 | 场景 / Scenario  | BPlusTree        | dict             |
@@ -119,12 +122,12 @@ def main() -> None:
 | 范围查询 10k     | {bp_rng}| {d_rng}|
 +------------------+------------------+------------------+
 """
-    print(tbl)
+    log("%s", tbl)
     if t_dict_range > 0:
         ratio = t_dict_range / t_bp_range
-        print(f"★ 范围查询优势: B+ 树约为 dict 的 {ratio:.1f}x 快")
-        print("  (B+ 树沿叶子 next 链顺序扫描，无需全表过滤与排序)")
-    print("=" * 60)
+        log("★ 范围查询优势: B+ 树约为 dict 的 %.1fx 快", ratio)
+        log("  (B+ 树沿叶子 next 链顺序扫描，无需全表过滤与排序)")
+    log("=" * 60)
 
 
 if __name__ == "__main__":

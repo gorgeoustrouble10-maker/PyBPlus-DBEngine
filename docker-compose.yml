@@ -1,0 +1,24 @@
+# PyBPlus-DBEngine Docker Compose
+# 数据持久化卷挂载 | Data volume mount | データ永続化ボリューム
+
+services:
+  pybplus:
+    build: .
+    container_name: pybplus-db
+    ports:
+      - "8765:8765"
+    volumes:
+      - pybplus_data:/data
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "scripts/healthcheck.py"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  pybplus_data:
+    name: pybplus_db_data
